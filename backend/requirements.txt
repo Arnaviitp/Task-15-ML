@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+sqlmodel
+spacy
+textblob
+nltk
+beautifulsoup4
+selenium
+transformers
+torch
