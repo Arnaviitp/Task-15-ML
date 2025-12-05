@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { getSettings, updateSetting, resetSettings, processScheduledComments, getScheduledComments } from '../api';
 import { Settings as SettingsIcon, Save, RefreshCw, Clock, Zap, Shield, Bell, RotateCcw } from 'lucide-react';
+import ConnectedAccounts from './ConnectedAccounts';
 
 const Settings = () => {
     const [settings, setSettings] = useState({
@@ -137,13 +138,17 @@ const Settings = () => {
                 <div>
                     <h2 style={{ margin: 0, marginBottom: '0.5rem' }}>⚙️ Settings</h2>
                     <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
-                        Configure automation, rate limits, and default preferences.
+                        Configure connected accounts, automation, rate limits, and preferences.
                     </p>
                 </div>
                 <button className="btn btn-secondary" onClick={handleReset}>
                     <RotateCcw size={18} /> Reset to Defaults
                 </button>
             </div>
+
+            <ConnectedAccounts />
+
+            <hr className="divider" />
 
             {saveStatus && (
                 <div style={{

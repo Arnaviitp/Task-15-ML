@@ -52,3 +52,20 @@ class AutomationTask(SQLModel, table=True):
     scheduled_for: datetime
     executed_at: Optional[datetime] = Field(default=None)
     result: Optional[str] = Field(default=None)
+
+class ConnectedAccount(SQLModel, table=True):
+    """Store connected social media accounts with OAuth tokens."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str  # twitter, linkedin, instagram
+    username: str
+    display_name: str
+    profile_image_url: Optional[str] = Field(default=None)
+    access_token: str  # Encrypted in production
+    refresh_token: Optional[str] = Field(default=None)
+    token_expires_at: Optional[datetime] = Field(default=None)
+    scopes: List[str] = Field(default=[], sa_column=Column(JSON))
+    is_active: bool = Field(default=True)
+    connected_at: datetime = Field(default_factory=datetime.utcnow)
+    last_used_at: Optional[datetime] = Field(default=None)
+    platform_metadata: dict = Field(default={}, sa_column=Column(JSON))  # Platform-specific data
+

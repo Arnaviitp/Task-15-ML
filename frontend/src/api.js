@@ -147,9 +147,56 @@ export const processScheduledComments = async () => {
   return response.data;
 };
 
+export const getAutomationStatus = async () => {
+  const response = await api.get('/automation/status');
+  return response.data;
+};
+
+// ==================== BATCH OPERATIONS ====================
+
+export const batchApproveAll = async () => {
+  const response = await api.post('/batch/approve-all');
+  return response.data;
+};
+
+export const batchRejectAll = async () => {
+  const response = await api.post('/batch/reject-all');
+  return response.data;
+};
+
+export const batchGenerateAll = async (tone = 'casual', length = 'medium', limit = 10) => {
+  const response = await api.post('/batch/generate-all', null, {
+    params: { tone, length, limit }
+  });
+  return response.data;
+};
+
+export const batchPostApproved = async () => {
+  const response = await api.post('/batch/post-approved');
+  return response.data;
+};
+
+// ==================== ACCOUNTS ====================
+
+export const getConnectedAccounts = async () => {
+  const response = await api.get('/accounts');
+  return response.data;
+};
+
+export const connectAccount = async (platform, username) => {
+  const response = await api.post('/accounts/connect', { platform, username });
+  return response.data;
+};
+
+export const disconnectAccount = async (accountId) => {
+  const response = await api.delete(`/accounts/${accountId}`);
+  return response.data;
+};
+
 // ==================== HEALTH ====================
 
 export const checkHealth = async () => {
   const response = await api.get('/health');
   return response.data;
 };
+

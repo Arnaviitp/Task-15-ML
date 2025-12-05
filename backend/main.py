@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlmodel import SQLModel, Session, create_engine, select
 from typing import List, Optional
-from models import Post, GeneratedComment, Settings, ActivityLog, AutomationTask
+from models import Post, GeneratedComment, Settings, ActivityLog, AutomationTask, ConnectedAccount
 from nlp_engine import CommentGenerator
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 # Database Setup
-sqlite_file_name = "database_v3.db"
+sqlite_file_name = "database_v4.db"
 sqlite_url = f"sqlite:///{sqlite_file_name}"
 engine = create_engine(sqlite_url, connect_args={"check_same_thread": False})
 
@@ -618,6 +618,241 @@ def process_scheduled_comments(session: Session = Depends(get_session)):
         "processed_count": len(processed),
         "processed_ids": processed
     }
+
+# ==================== BATCH OPERATIONS ====================
+
+@app.post("/batch/approve-all")
+def batch_approve_comments(session: Session = Depends(get_session)):
+    """Approve all pending comments."""
+    pending_comments = session.exec(
+        select(GeneratedComment).where(GeneratedComment.status == "pending")
+    ).all()
+    
+    approved_ids = []
+    for comment in pending_comments:
+        comment.status = "approved"
+        session.add(comment)
+        approved_ids.append(comment.id)
+    
+    session.commit()
+    log_activity(session, "batch_approve", f"Batch approved {len(approved_ids)} comments")
+    
+    return {
+        "approved_count": len(approved_ids),
+        "approved_ids": approved_ids
+    }
+
+@app.post("/batch/reject-all")
+def batch_reject_comments(session: Session = Depends(get_session)):
+    """Reject all pending comments."""
+    pending_comments = session.exec(
+        select(GeneratedComment).where(GeneratedComment.status == "pending")
+    ).all()
+    
+    rejected_ids = []
+    for comment in pending_comments:
+        comment.status = "rejected"
+        session.add(comment)
+        rejected_ids.append(comment.id)
+    
+    session.commit()
+    log_activity(session, "batch_reject", f"Batch rejected {len(rejected_ids)} comments")
+    
+    return {
+        "rejected_count": len(rejected_ids),
+        "rejected_ids": rejected_ids
+    }
+
+@app.post("/batch/generate-all")
+def batch_generate_comments(
+    tone: str = "casual",
+    length: str = "medium",
+    limit: int = 10,
+    session: Session = Depends(get_session)
+):
+    """Generate comments for all posts that don't have comments yet."""
+    # Get posts without comments
+    posts_with_comments = session.exec(
+        select(GeneratedComment.post_id).distinct()
+    ).all()
+    
+    posts = session.exec(
+        select(Post).where(~Post.id.in_(posts_with_comments) if posts_with_comments else True)
+        .limit(limit)
+    ).all()
+    
+    generated = []
+    errors = []
+    
+    for post in posts:
+        try:
+            result = nlp_engine.generate_comment(
+                post.content, tone, length, False, post.platform
+            )
+            
+            if not result.get("flagged"):
+                comment = GeneratedComment(
+                    post_id=post.id,
+                    content=result["comment"],
+                    tone=tone,
+                    length=length,
+                    sentiment_score=result["analysis"]["sentiment"],
+                    subjectivity_score=result["analysis"]["subjectivity"],
+                    topics_extracted=result["analysis"]["topics"],
+                    has_question=False,
+                    status="pending"
+                )
+                session.add(comment)
+                generated.append({"post_id": post.id, "comment": result["comment"][:50] + "..."})
+        except Exception as e:
+            errors.append({"post_id": post.id, "error": str(e)})
+    
+    session.commit()
+    log_activity(session, "batch_generate", f"Batch generated {len(generated)} comments")
+    
+    return {
+        "generated_count": len(generated),
+        "generated": generated,
+        "errors": errors
+    }
+
+@app.post("/batch/post-approved")
+def batch_post_approved_comments(session: Session = Depends(get_session)):
+    """Post all approved comments."""
+    approved_comments = session.exec(
+        select(GeneratedComment).where(GeneratedComment.status == "approved")
+    ).all()
+    
+    posted_ids = []
+    for comment in approved_comments:
+        comment.status = "posted"
+        comment.posted_at = datetime.utcnow()
+        session.add(comment)
+        posted_ids.append(comment.id)
+    
+    session.commit()
+    log_activity(session, "batch_post", f"Batch posted {len(posted_ids)} approved comments")
+    
+    return {
+        "posted_count": len(posted_ids),
+        "posted_ids": posted_ids
+    }
+
+@app.get("/automation/status")
+def get_automation_status(session: Session = Depends(get_session)):
+    """Get current automation status and statistics."""
+    now = datetime.utcnow()
+    last_24h = now - timedelta(hours=24)
+    last_hour = now - timedelta(hours=1)
+    
+    # Get various counts
+    pending_count = session.query(GeneratedComment).filter(GeneratedComment.status == "pending").count()
+    approved_count = session.query(GeneratedComment).filter(GeneratedComment.status == "approved").count()
+    scheduled_count = session.query(GeneratedComment).filter(GeneratedComment.status == "scheduled").count()
+    
+    # Due scheduled comments
+    due_comments = session.query(GeneratedComment).filter(
+        GeneratedComment.status == "scheduled",
+        GeneratedComment.scheduled_at <= now
+    ).count()
+    
+    # Rate limit status
+    rate_limit = int(get_setting(session, "rate_limit_per_hour"))
+    recent_count = session.query(GeneratedComment).filter(GeneratedComment.created_at > last_hour).count()
+    
+    # Recent activity
+    recent_posts = session.query(Post).filter(Post.fetched_at > last_24h).count()
+    recent_comments = session.query(GeneratedComment).filter(GeneratedComment.created_at > last_24h).count()
+    recent_posted = session.query(GeneratedComment).filter(
+        GeneratedComment.status == "posted",
+        GeneratedComment.posted_at > last_24h
+    ).count()
+    
+    return {
+        "current_time": now.isoformat(),
+        "queue_status": {
+            "pending": pending_count,
+            "approved": approved_count,
+            "scheduled": scheduled_count,
+            "due_for_posting": due_comments
+        },
+        "rate_limit": {
+            "limit_per_hour": rate_limit,
+            "used_this_hour": recent_count,
+            "remaining": max(0, rate_limit - recent_count)
+        },
+        "last_24h_activity": {
+            "posts_fetched": recent_posts,
+            "comments_generated": recent_comments,
+            "comments_posted": recent_posted
+        },
+        "automation_settings": {
+            "auto_generate_enabled": get_setting(session, "auto_generate_enabled") == "true",
+            "auto_post_enabled": get_setting(session, "auto_post_enabled") == "true"
+        }
+    }
+
+# ==================== CONNECTED ACCOUNTS ====================
+
+@app.get("/accounts", response_model=List[ConnectedAccount])
+def get_connected_accounts(session: Session = Depends(get_session)):
+    """Get all connected social media accounts."""
+    return session.exec(select(ConnectedAccount)).all()
+
+class ConnectAccountRequest(BaseModel):
+    platform: str
+    username: str
+
+@app.post("/accounts/connect")
+def connect_account(
+    request: ConnectAccountRequest,
+    session: Session = Depends(get_session)
+):
+    """Simulate connecting a social media account."""
+    # In a real app, this would handle OAuth callbacks or generate auth URLs
+    # For this demo, we'll simulate a successful connection
+    
+    # Check if already connected
+    existing = session.exec(
+        select(ConnectedAccount)
+        .where(ConnectedAccount.platform == request.platform)
+        .where(ConnectedAccount.username == request.username)
+    ).first()
+    
+    if existing:
+        raise HTTPException(status_code=400, detail="Account already connected")
+    
+    account = ConnectedAccount(
+        platform=request.platform,
+        username=request.username,
+        display_name=request.username,  # Using username as display name for demo
+        profile_image_url=f"https://ui-avatars.com/api/?name={request.username}&background=random",
+        access_token="mock_token_" + datetime.utcnow().isoformat(),
+        scopes=["read", "write"],
+        is_active=True
+    )
+    
+    session.add(account)
+    session.commit()
+    session.refresh(account)
+    
+    log_activity(session, "account_connected", f"Connected {request.platform} account: {request.username}")
+    
+    return account
+
+@app.delete("/accounts/{account_id}")
+def disconnect_account(account_id: int, session: Session = Depends(get_session)):
+    """Disconnect a social media account."""
+    account = session.get(ConnectedAccount, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+        
+    session.delete(account)
+    session.commit()
+    
+    log_activity(session, "account_disconnected", f"Disconnected {account.platform} account: {account.username}")
+    
+    return {"message": "Account disconnected successfully"}
 
 # ==================== HEALTH CHECK ====================
 
