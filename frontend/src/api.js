@@ -183,8 +183,10 @@ export const getConnectedAccounts = async () => {
   return response.data;
 };
 
-export const connectAccount = async (platform, username) => {
-  const response = await api.post('/accounts/connect', { platform, username });
+export const connectAccount = async (platform, username, accessToken = null) => {
+  const payload = { platform, username };
+  if (accessToken) payload.access_token = accessToken;
+  const response = await api.post('/accounts/connect', payload);
   return response.data;
 };
 

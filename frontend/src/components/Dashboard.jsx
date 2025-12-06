@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { fetchPosts, getPosts, generateComment, createPost, generateVariations } from '../api';
-import { RefreshCw, Send, Loader, Plus, Sparkles, Hash, Heart, MessageCircle, Share2, User } from 'lucide-react';
+import { fetchPosts, getPosts, generateComment, createPost, generateVariations, getConnectedAccounts } from '../api';
+import { RefreshCw, Send, Loader, Plus, Sparkles, Hash, Heart, MessageCircle, Share2, User, Link as LinkIcon, AlertCircle } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { useToast } from './ToastProvider';
 
 const Dashboard = () => {
     const [posts, setPosts] = useState([]);
@@ -8,6 +10,8 @@ const Dashboard = () => {
     const [generating, setGenerating] = useState(null);
     const [showVariations, setShowVariations] = useState(null);
     const [variations, setVariations] = useState([]);
+    const [connectedAccounts, setConnectedAccounts] = useState([]);
+    const [checkingAccounts, setCheckingAccounts] = useState(true);
 
     // Comment Generation Settings
     const [settings, setSettings] = useState({
@@ -28,29 +32,77 @@ const Dashboard = () => {
     // Platform filter
     const [platformFilter, setPlatformFilter] = useState('all');
 
+    const { success, error, info, warning } = useToast();
+
     useEffect(() => {
-        loadPosts();
+        checkConnectionsAndLoad();
     }, []);
 
-    const loadPosts = async () => {
+    const checkConnectionsAndLoad = async () => {
         setLoading(true);
+        setCheckingAccounts(true);
+        try {
+            const accounts = await getConnectedAccounts();
+            setConnectedAccounts(accounts);
+
+            // Only fetch posts if there are connected accounts
+            if (accounts.length > 0) {
+                let currentPosts = await getPosts();
+
+                // If no posts in DB, try auto-fetching
+                if (currentPosts.length === 0) {
+                    info("Initialize feed: Fetching posts from connected accounts...");
+                    try {
+                        await fetchPosts();
+                        currentPosts = await getPosts();
+                        if (currentPosts.length > 0) {
+                            success("Posts fetched successfully!");
+                        }
+                    } catch (err) {
+                        console.error("Auto-fetch failed:", err);
+                        // Don't show error to user immediately, let them use manual button
+                    }
+                }
+                setPosts(currentPosts);
+            } else {
+                setPosts([]);
+            }
+        } catch (err) {
+            console.error("Error initializing dashboard:", err);
+            error("Failed to load dashboard data");
+        } finally {
+            setLoading(false);
+            setCheckingAccounts(false);
+        }
+    };
+
+    const loadPosts = async () => {
         try {
             const data = await getPosts();
             setPosts(data);
-        } catch (error) {
-            console.error("Error fetching posts:", error);
-        } finally {
-            setLoading(false);
+        } catch (err) {
+            console.error("Error fetching posts:", err);
         }
     };
 
     const handleRefresh = async () => {
         setLoading(true);
+
+        // Check if we have any scraper accounts
+        const hasScraper = connectedAccounts.some(acc => acc.access_token === 'scraper');
+        if (hasScraper) {
+            info("Launching browser to fetch posts... Please log in if prompted.", 6000);
+        } else {
+            info("Fetching new posts...");
+        }
+
         try {
             await fetchPosts();
             await loadPosts();
-        } catch (error) {
-            console.error("Error refreshing feed:", error);
+            success("Feed updated!");
+        } catch (err) {
+            console.error("Error refreshing feed:", err);
+            error("Failed to fetch new posts. Check console/logs.");
         } finally {
             setLoading(false);
         }
@@ -401,9 +453,25 @@ const Dashboard = () => {
                     </div>
                 ))}
 
-                {filteredPosts.length === 0 && (
+                {filteredPosts.length === 0 && !loading && (
                     <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '4rem', color: 'var(--text-secondary)' }}>
-                        <p>No posts found. Click "Fetch New Posts" to load sample data.</p>
+                        {connectedAccounts.length === 0 && !checkingAccounts ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem' }}>
+                                <AlertCircle size={48} style={{ opacity: 0.5 }} />
+                                <h3>No Accounts Connected</h3>
+                                <p style={{ maxWidth: '400px', margin: '0 auto' }}>To get started, please connect at least one social media account.</p>
+                                <Link to="/settings" className="btn btn-primary" style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                                    <LinkIcon size={18} /> Connect Account
+                                </Link>
+                            </div>
+                        ) : (
+                            <div>
+                                <p>No posts found for the selected filter.</p>
+                                <button className="btn btn-secondary" onClick={handleRefresh}>
+                                    <RefreshCw size={16} style={{ marginRight: '0.5rem' }} /> Fetch New Posts
+                                </button>
+                            </div>
+                        )}
                     </div>
                 )}
             </div>

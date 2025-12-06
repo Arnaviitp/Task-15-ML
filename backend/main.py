@@ -5,6 +5,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 from typing import List, Optional
 from models import Post, GeneratedComment, Settings, ActivityLog, AutomationTask, ConnectedAccount
 from nlp_engine import CommentGenerator
+from social_integrations import SocialMediaFactory
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import io
@@ -167,22 +168,75 @@ def fetch_mock_posts():
 
 @app.post("/posts/fetch", response_model=List[Post])
 def fetch_posts(session: Session = Depends(get_session)):
-    """Simulates fetching posts from social media platforms."""
-    mock_data = fetch_mock_posts()
+    """Fetches posts from social media platforms (Real or Mock)."""
+    # Get connected accounts
+    connected_accounts = session.exec(select(ConnectedAccount)).all()
+    connected_platforms = {acc.platform.lower() for acc in connected_accounts}
+    
     new_posts = []
-    for data in mock_data:
+    
+    # 1. Fetch Real Posts from Connected Accounts
+    for account in connected_accounts:
+        try:
+            # Determine method based on account data (if it has access_token, use API, else Scraper?)
+            # Actually, we should store the 'method' in ConnectedAccount metadata or deduce it.
+            # Current logic: If access_token starts with "mock_", it is mock.
+            # If access_token is "scraper", it is scraper.
+            # Else, it is Real API.
+            
+            method = "api"
+            if account.access_token == "scraper":
+                 method = "scraper"
+            elif account.access_token and account.access_token.startswith("mock_token_"):
+                 continue # Key handled by mock logic below
+            
+            integration = SocialMediaFactory.get_integration(account.platform, method=method)
+            
+            # For scraper, we might not need access_token but we pass what we have
+            creds = {"access_token": account.access_token, "username": account.username}
+            real_posts = integration.fetch_posts(creds)
+            
+            for post_data in real_posts:
+                existing = session.exec(select(Post).where(Post.url == post_data["url"])).first()
+                if not existing:
+                    post = Post(**post_data)
+                    session.add(post)
+                    new_posts.append(post)
+                    
+            if real_posts:
+                log_activity(session, "posts_fetched_real", f"Fetched {len(real_posts)} posts from {account.platform} via {method}")
+            
+        except Exception as e:
+            log_activity(session, "posts_fetch_error", f"Error fetching from {account.platform}: {str(e)}")
+            print(f"Error fetching from {account.platform}: {e}")
+
+    # 2. Fetch Mock Posts (fallback or for simulated accounts)
+    # Only if we have no real accounts for a platform, OR we just want to mix them in (user preference?)
+    # For now, we mix them in but filter by connected platforms as before
+    
+    mock_data = fetch_mock_posts()
+    filtered_mock_data = [
+        data for data in mock_data 
+        if data["platform"].lower() in connected_platforms
+    ]
+    
+    for data in filtered_mock_data:
+        # Check if we already have this Mock URL
         existing = session.exec(select(Post).where(Post.url == data["url"])).first()
         if not existing:
             post = Post(**data)
             session.add(post)
             new_posts.append(post)
+
     session.commit()
     for post in new_posts:
         session.refresh(post)
     
     if new_posts:
-        log_activity(session, "posts_fetched", f"Fetched {len(new_posts)} new posts from social media")
-    
+        log_activity(session, "posts_fetched", f"Fetched {len(new_posts)} new posts total")
+    elif not connected_platforms:
+         log_activity(session, "posts_fetch_skipped", "No connected accounts found to fetch posts from")
+
     return new_posts
 
 @app.get("/posts", response_model=List[Post])
@@ -191,10 +245,42 @@ def get_posts(
     limit: int = Query(default=50, le=100),
     session: Session = Depends(get_session)
 ):
-    """Get all posts, optionally filtered by platform."""
+    """Get all posts, optionally filtered by platform and restricted to connected accounts."""
+    # Get connected platforms
+    connected_accounts = session.exec(select(ConnectedAccount)).all()
+    connected_platforms = {acc.platform.lower() for acc in connected_accounts}
+    
+    if not connected_platforms:
+        return []
+
     query = select(Post)
+    
     if platform:
+        # Ensure the requested platform is actually connected
+        if platform.lower() not in connected_platforms:
+            return []
         query = query.where(Post.platform == platform)
+    else:
+        # Filter for all connected platforms
+        # We need to match the case stored in DB. Mock data uses Title Case.
+        # We'll construct a list of valid platform strings to query.
+        # This handles the main ones. For "Manual" or others, they might be filtered out if not in this list, 
+        # which adheres to "only show post of connected account".
+        
+        # Standardize known platforms
+        standard_platforms = ["Twitter", "LinkedIn", "Instagram", "Facebook"]
+        valid_db_platforms = [p for p in standard_platforms if p.lower() in connected_platforms]
+        
+        # Also allow exact case matches if stored differently (e.g. if user manually added "twitter")
+        # But for SQLModel in_(), we need the exact strings. 
+        # Let's add the lowercase versions too just in case manual posts used them.
+        for p in connected_platforms:
+            if p not in [sp.lower() for sp in valid_db_platforms]:
+                valid_db_platforms.append(p)
+                valid_db_platforms.append(p.capitalize())
+
+        query = query.where(Post.platform.in_(valid_db_platforms))
+
     query = query.order_by(Post.fetched_at.desc()).limit(limit)
     return session.exec(query).all()
 
@@ -802,32 +888,71 @@ def get_connected_accounts(session: Session = Depends(get_session)):
 class ConnectAccountRequest(BaseModel):
     platform: str
     username: str
+    access_token: Optional[str] = None
 
 @app.post("/accounts/connect")
 def connect_account(
     request: ConnectAccountRequest,
     session: Session = Depends(get_session)
 ):
-    """Simulate connecting a social media account."""
-    # In a real app, this would handle OAuth callbacks or generate auth URLs
-    # For this demo, we'll simulate a successful connection
+    """Connect a social media account (Real or Simulated)."""
     
-    # Check if already connected
+    # Check if already connected (by username logic, or update token if exists)
+    # Ideally should check by Platform User ID, but we use username for now.
+    
+    platform_data = {}
+    final_username = request.username
+    final_token = request.access_token
+    
+    # 1. Scraper Mode check (Special flag in token or no token??)
+    # Let's say if token is "scraper", we treat it as no-api mode
+    if request.access_token == "scraper":
+        final_token = "scraper"
+        integration = SocialMediaFactory.get_integration(request.platform, method="scraper")
+        # Validate lightly
+        validation = integration.validate_token({"username": request.username})
+    
+    # 2. Real Token Mode
+    elif request.access_token:
+        try:
+            integration = SocialMediaFactory.get_integration(request.platform, method="api")
+            validation = integration.validate_token({"access_token": request.access_token})
+            
+            if not validation.get("valid"):
+                raise HTTPException(status_code=400, detail=f"Invalid Access Token: {validation.get('error')}")
+            
+            if validation.get("username"):
+                final_username = validation["username"]
+            
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    # 3. Simulation Mode
+    else:
+        final_token = "mock_token_" + datetime.utcnow().isoformat()
+    
+    # Check if exists
     existing = session.exec(
         select(ConnectedAccount)
         .where(ConnectedAccount.platform == request.platform)
-        .where(ConnectedAccount.username == request.username)
+        .where(ConnectedAccount.username == final_username)
     ).first()
     
     if existing:
-        raise HTTPException(status_code=400, detail="Account already connected")
+        # Update token if re-connecting
+        existing.access_token = final_token
+        existing.is_active = True
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        log_activity(session, "account_updated", f"Updated {request.platform} account: {final_username}")
+        return existing
     
     account = ConnectedAccount(
         platform=request.platform,
-        username=request.username,
-        display_name=request.username,  # Using username as display name for demo
-        profile_image_url=f"https://ui-avatars.com/api/?name={request.username}&background=random",
-        access_token="mock_token_" + datetime.utcnow().isoformat(),
+        username=final_username,
+        display_name=final_username,
+        profile_image_url=f"https://ui-avatars.com/api/?name={final_username}&background=random",
+        access_token=final_token,
         scopes=["read", "write"],
         is_active=True
     )
@@ -836,7 +961,7 @@ def connect_account(
     session.commit()
     session.refresh(account)
     
-    log_activity(session, "account_connected", f"Connected {request.platform} account: {request.username}")
+    log_activity(session, "account_connected", f"Connected {request.platform} account: {final_username}")
     
     return account
 

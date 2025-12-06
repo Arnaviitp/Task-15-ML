@@ -10,3 +10,4 @@ selenium
 transformers
 torch
 better_profanity
+webdriver-manager

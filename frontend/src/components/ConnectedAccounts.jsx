@@ -10,7 +10,7 @@ const ConnectedAccounts = () => {
     const [accounts, setAccounts] = useState([]);
     const [loading, setLoading] = useState(false);
     const [connecting, setConnecting] = useState(null);
-    const [formData, setFormData] = useState({ username: '' });
+    const [formData, setFormData] = useState({ username: '', accessToken: '', mode: 'simulation' }); // simulation, api, scraper
     const [showModal, setShowModal] = useState(null); // 'twitter', 'linkedin', etc.
     const { success, error, info } = useToast();
 
@@ -33,14 +33,20 @@ const ConnectedAccounts = () => {
 
     const handleConnect = async (e) => {
         e.preventDefault();
-        if (!formData.username.trim()) return;
 
         try {
             setConnecting(showModal);
             const platformConfig = supportedPlatforms.find(p => p.id === showModal);
-            await connectAccount(platformConfig.name, formData.username);
-            success(`Successfully connected ${formData.username} to ${platformConfig.name}`);
-            setFormData({ username: '' });
+
+            // Determine token based on mode
+            let token = null;
+            if (formData.mode === 'api') token = formData.accessToken;
+            if (formData.mode === 'scraper') token = 'scraper';
+
+            await connectAccount(platformConfig.name, formData.username, token);
+
+            success(`Successfully connected to ${platformConfig.name}`);
+            setFormData({ username: '', accessToken: '', mode: 'simulation' });
             setShowModal(null);
             loadAccounts();
         } catch (err) {
@@ -52,7 +58,8 @@ const ConnectedAccounts = () => {
     };
 
     const handleDisconnect = async (accountId, platform) => {
-        if (!window.confirm(`Are you sure you want to disconnect this ${platform} account?`)) return;
+        console.log("Attempting to disconnect:", accountId, platform);
+        // if (!window.confirm(`Are you sure you want to disconnect this ${platform} account?`)) return;
 
         try {
             await disconnectAccount(accountId);
@@ -162,9 +169,12 @@ const ConnectedAccounts = () => {
                                                 </div>
                                             </div>
                                             <button
-                                                onClick={() => handleDisconnect(acc.id, platform.name)}
+                                                onClick={(e) => {
+                                                    e.stopPropagation(); // Prevent duplicate events
+                                                    handleDisconnect(acc.id, platform.name);
+                                                }}
                                                 className="icon-btn"
-                                                style={{ width: '28px', height: '28px', color: '#ef4444' }}
+                                                style={{ width: '28px', height: '28px', color: '#ef4444', zIndex: 10, position: 'relative' }}
                                                 title="Disconnect"
                                             >
                                                 <Trash2 size={14} />
@@ -215,49 +225,56 @@ const ConnectedAccounts = () => {
                             {getPlatformIcon(showModal)}
                             Connect {showModal.charAt(0).toUpperCase() + showModal.slice(1)}
                         </h3>
-                        <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>
-                            Enter your username to simulate the OAuth connection process.
+
+                        <div style={{ marginBottom: '1.5rem', background: 'rgba(255,255,255,0.05)', padding: '0.25rem', borderRadius: '0.5rem', display: 'flex', gap: '0.25rem' }}>
+                            <button type="button" onClick={() => setFormData({ ...formData, mode: 'simulation' })}
+                                style={{ flex: 1, padding: '0.5rem', border: 'none', background: formData.mode === 'simulation' ? 'var(--primary)' : 'transparent', color: formData.mode === 'simulation' ? 'white' : 'var(--text-secondary)', borderRadius: '0.25rem', cursor: 'pointer', fontSize: '0.75rem' }}>
+                                Simulation
+                            </button>
+                            <button type="button" onClick={() => setFormData({ ...formData, mode: 'scraper' })}
+                                style={{ flex: 1, padding: '0.5rem', border: 'none', background: formData.mode === 'scraper' ? 'var(--primary)' : 'transparent', color: formData.mode === 'scraper' ? 'white' : 'var(--text-secondary)', borderRadius: '0.25rem', cursor: 'pointer', fontSize: '0.75rem' }}>
+                                Browser (No API)
+                            </button>
+                            <button type="button" onClick={() => setFormData({ ...formData, mode: 'api' })}
+                                style={{ flex: 1, padding: '0.5rem', border: 'none', background: formData.mode === 'api' ? 'var(--primary)' : 'transparent', color: formData.mode === 'api' ? 'white' : 'var(--text-secondary)', borderRadius: '0.25rem', cursor: 'pointer', fontSize: '0.75rem' }}>
+                                Developer API
+                            </button>
+                        </div>
+
+                        <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem', fontSize: '0.9rem' }}>
+                            {formData.mode === 'simulation' && "Enter a username to simulate a connection with mock data."}
+                            {formData.mode === 'scraper' && "Uses an automated browser to visit the public profile. No API key needed. (Note: May require manual login in the opened window)."}
+                            {formData.mode === 'api' && "Enter your API Access Token. The app will fetch your real posts."}
                         </p>
 
                         <form onSubmit={handleConnect}>
-                            <div className="form-group">
-                                <label>Username</label>
-                                <div style={{ position: 'relative' }}>
-                                    <span style={{
-                                        position: 'absolute',
-                                        left: '1rem',
-                                        top: '0.75rem',
-                                        color: 'var(--text-secondary)'
-                                    }}>@</span>
-                                    <input
-                                        autoFocus
-                                        type="text"
-                                        className="input-field"
-                                        style={{ paddingLeft: '2.5rem' }}
-                                        placeholder="username"
-                                        value={formData.username}
-                                        onChange={e => setFormData({ ...formData, username: e.target.value })}
-                                        required
-                                    />
+                            {formData.mode !== 'api' && (
+                                <div className="form-group" style={{ marginBottom: '1rem' }}>
+                                    <label>Username</label>
+                                    <div style={{ position: 'relative' }}>
+                                        <span style={{ position: 'absolute', left: '1rem', top: '0.75rem', color: 'var(--text-secondary)' }}>@</span>
+                                        <input autoFocus type="text" className="input-field" style={{ paddingLeft: '2.5rem' }} placeholder="username"
+                                            value={formData.username} onChange={e => setFormData({ ...formData, username: e.target.value })} required />
+                                    </div>
                                 </div>
-                            </div>
+                            )}
+
+                            {formData.mode === 'api' && (
+                                <div className="form-group" style={{ marginBottom: '1rem' }}>
+                                    <label>Access Token (Bearer)</label>
+                                    <input autoFocus type="password" className="input-field" placeholder="e.g. AAAAAAAAAAAAAAAAAAAAA..."
+                                        value={formData.accessToken} onChange={e => setFormData({ ...formData, accessToken: e.target.value })} required />
+                                    <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
+                                        Check README for how to generate tokens.
+                                    </p>
+                                </div>
+                            )}
 
                             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
-                                <button
-                                    type="button"
-                                    className="btn btn-secondary"
-                                    onClick={() => setShowModal(null)}
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    type="submit"
-                                    className="btn btn-primary"
-                                    disabled={connecting || !formData.username}
-                                    style={{
-                                        background: getPlatformColor(showModal)
-                                    }}
-                                >
+                                <button type="button" className="btn btn-secondary" onClick={() => setShowModal(null)}>Cancel</button>
+                                <button type="submit" className="btn btn-primary"
+                                    disabled={connecting || (formData.mode === 'api' && !formData.accessToken) || (formData.mode !== 'api' && !formData.username)}
+                                    style={{ background: getPlatformColor(showModal) }}>
                                     {connecting ? 'Connecting...' : 'Connect Account'}
                                 </button>
                             </div>
