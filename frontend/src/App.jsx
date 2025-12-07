@@ -1,18 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter as Router, Routes, Route, NavLink, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, MessageSquare, BarChart2, Settings as SettingsIcon,
-  Sparkles, Bot, Sun, Moon, HelpCircle, Zap, Bell, X, RefreshCw
+  Sparkles, Bot, Sun, Moon, HelpCircle, Zap, Bell, X, RefreshCw, Activity, Wand2
 } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import ReviewQueue from './components/ReviewQueue';
 import Analytics from './components/Analytics';
+import ActivityLog from './components/ActivityLog';
 import Settings from './components/Settings';
 import AutomationCenter from './components/AutomationCenter';
+import AITools from './components/AITools';
 import QuickActions from './components/QuickActions';
 import OnboardingTour, { resetOnboardingTour } from './components/OnboardingTour';
 import { ToastProvider, useToast } from './components/ToastProvider';
 import { getAnalytics, getComments } from './api';
+import ErrorBoundary from './components/ErrorBoundary';
 
 // Notification Badge Component
 const NotificationBadge = ({ count }) => {
@@ -91,6 +94,18 @@ const AppHeader = ({ darkMode, toggleDarkMode, pendingCount }) => {
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <BarChart2 size={18} />
             <span>Analytics</span>
+          </div>
+        </NavLink>
+        <NavLink to="/ai-tools" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <Wand2 size={18} />
+            <span>AI Tools</span>
+          </div>
+        </NavLink>
+        <NavLink to="/logs" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <Activity size={18} />
+            <span>Activity</span>
           </div>
         </NavLink>
         <NavLink to="/settings" className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}>
@@ -218,25 +233,25 @@ const AppContent = () => {
   const [pendingCount, setPendingCount] = useState(0);
   const location = useLocation();
 
-  useEffect(() => {
-    loadPendingCount();
-    const interval = setInterval(loadPendingCount, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    // Apply theme
-    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
-  }, [darkMode]);
-
-  const loadPendingCount = async () => {
+  const loadPendingCount = useCallback(async () => {
     try {
       const comments = await getComments('pending');
       setPendingCount(comments.length);
     } catch (error) {
       console.error('Error loading pending count:', error);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadPendingCount();
+    const interval = setInterval(loadPendingCount, 30000);
+    return () => clearInterval(interval);
+  }, [loadPendingCount]);
+
+  useEffect(() => {
+    // Apply theme
+    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
@@ -259,6 +274,8 @@ const AppContent = () => {
             <Route path="/review" element={<ReviewQueue onUpdate={loadPendingCount} />} />
             <Route path="/automation" element={<AutomationCenter />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/ai-tools" element={<AITools />} />
+            <Route path="/logs" element={<ActivityLog />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
@@ -372,9 +389,11 @@ const KeyboardShortcuts = () => {
 function App() {
   return (
     <ToastProvider>
-      <Router>
-        <AppContent />
-      </Router>
+      <ErrorBoundary>
+        <Router>
+          <AppContent />
+        </Router>
+      </ErrorBoundary>
     </ToastProvider>
   );
 }

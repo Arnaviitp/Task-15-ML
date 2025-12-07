@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export const api = axios.create({
   baseURL: API_URL,
@@ -98,7 +98,12 @@ export const validateComment = async (content) => {
 // ==================== ANALYTICS ====================
 
 export const getAnalytics = async () => {
-  const response = await api.get('/analytics');
+  const response = await api.get('/automation/status'); // Using automation status as "current analytics"
+  return response.data;
+};
+
+export const getAnalyticsHistory = async (days = 7) => {
+  const response = await api.get('/analytics/history', { params: { days } });
   return response.data;
 };
 
@@ -195,10 +200,118 @@ export const disconnectAccount = async (accountId) => {
   return response.data;
 };
 
+// ==================== AI FEATURES ====================
+
+export const predictEngagement = async (comment, postContent, platform = 'default') => {
+  const response = await api.post('/ai/predict-engagement', null, {
+    params: { comment, post_content: postContent, platform }
+  });
+  return response.data;
+};
+
+export const suggestEmojis = async (content, platform = 'default', count = 5) => {
+  const response = await api.post('/ai/suggest-emojis', null, {
+    params: { content, platform, count }
+  });
+  return response.data;
+};
+
+export const generateHashtags = async (content, platform = 'default', count = 5) => {
+  const response = await api.post('/ai/generate-hashtags', null, {
+    params: { content, platform, count }
+  });
+  return response.data;
+};
+
+export const getOptimalPostingTimes = async (platform = 'default') => {
+  const response = await api.get(`/ai/optimal-posting-times/${platform}`);
+  return response.data;
+};
+
+export const enhanceComment = async (comment, platform = 'default', addEmojis = true, addHashtags = false, engagementBoost = true) => {
+  const response = await api.post('/ai/enhance-comment', null, {
+    params: {
+      comment,
+      platform,
+      add_emojis: addEmojis,
+      add_hashtags: addHashtags,
+      engagement_boost: engagementBoost
+    }
+  });
+  return response.data;
+};
+
+// ==================== PERSONAS ====================
+
+export const getPersonas = async () => {
+  const response = await api.get('/personas');
+  return response.data;
+};
+
+export const createPersona = async (personaData) => {
+  const response = await api.post('/personas', personaData);
+  return response.data;
+};
+
+export const updatePersona = async (personaId, personaData) => {
+  const response = await api.put(`/personas/${personaId}`, personaData);
+  return response.data;
+};
+
+export const deletePersona = async (personaId) => {
+  const response = await api.delete(`/personas/${personaId}`);
+  return response.data;
+};
+
+export const setDefaultPersona = async (personaId) => {
+  const response = await api.post(`/personas/${personaId}/set-default`);
+  return response.data;
+};
+
+export const generateCommentWithPersona = async (postId, personaId, length = 'medium', includeQuestion = false) => {
+  const response = await api.post(`/comments/generate-with-persona/${postId}`, null, {
+    params: { persona_id: personaId, length, include_question: includeQuestion }
+  });
+  return response.data;
+};
+
+// ==================== TEMPLATES ====================
+
+export const getTemplates = async () => {
+  const response = await api.get('/templates');
+  return response.data;
+};
+
+export const saveTemplate = async (templateData) => {
+  const response = await api.post('/templates', templateData);
+  return response.data;
+};
+
+export const deleteTemplate = async (templateId) => {
+  const response = await api.delete(`/templates/${templateId}`);
+  return response.data;
+};
+
+// ==================== ADVANCED ANALYTICS ====================
+
+export const getSentimentTrends = async (days = 7) => {
+  const response = await api.get('/analytics/sentiment-trends', { params: { days } });
+  return response.data;
+};
+
+export const getToneDistribution = async () => {
+  const response = await api.get('/analytics/tone-distribution');
+  return response.data;
+};
+
+export const getPlatformPerformance = async () => {
+  const response = await api.get('/analytics/platform-performance');
+  return response.data;
+};
+
 // ==================== HEALTH ====================
 
 export const checkHealth = async () => {
   const response = await api.get('/health');
   return response.data;
 };
-

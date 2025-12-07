@@ -29,17 +29,30 @@ class SocialMediaIntegration:
 class ScraperIntegration(SocialMediaIntegration):
     """Base class for Selenium-based scraping."""
     
-    def _get_driver(self):
+    def _get_driver(self, profile_id: str = "default"):
         options = Options()
         # options.add_argument("--headless") # Comment out to see the browser (better for debugging/login)
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        # Use a consistent user data dir to persist logins if desired (optional)
-        # options.add_argument("user-data-dir=./selenium_profile") 
+        # Anti-detection
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        
+        # Use a consistent user data dir to persist logins
+        # Create a unique profile for each account to avoid conflicts and save sessions
+        import os
+        base_dir = os.path.join(os.getcwd(), "selenium_profiles")
+        os.makedirs(base_dir, exist_ok=True)
+        profile_dir = os.path.join(base_dir, profile_id)
+        options.add_argument(f"user-data-dir={profile_dir}")
         
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        
+        # Patch navigator.webdriver
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
 
     def _wait_and_check_login(self, driver):
@@ -67,6 +80,7 @@ class ScraperIntegration(SocialMediaIntegration):
             return False
         except Exception as e:
             logger.error(f"Error checking login: {e}")
+            driver.save_screenshot("debug_login_check_error.png")
             return False
             
     def _keep_open_on_failure(self, driver, item_count):
@@ -83,7 +97,7 @@ class TwitterScraper(ScraperIntegration):
         if not username:
             return []
             
-        driver = self._get_driver()
+        driver = self._get_driver(f"twitter_{username}")
         posts = []
         try:
             url = f"https://twitter.com/{username}"
@@ -96,41 +110,53 @@ class TwitterScraper(ScraperIntegration):
                 driver.refresh()
                 time.sleep(5)
             
+            # DEBUG: Screenshot before scraping
+            driver.save_screenshot(f"debug_twitter_{username}_start.png")
+            
+            # Wait for timeline
             try:
-                # Wait for timeline (articles)
-                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
+                # Wait for the primary column or check for empty state
+                WebDriverWait(driver, 20).until(
+                    EC.any_of(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='tweet']")),
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='primaryColumn']"))
+                    )
+                )
             except:
-                logger.warning("Timeout waiting for Twitter articles. Checking for login wall again...")
+                logger.warning("Timeout waiting for Twitter content.")
+                driver.save_screenshot(f"debug_twitter_{username}_timeout.png")
                 if self._wait_and_check_login(driver):
                     driver.refresh()
                     time.sleep(5)
                 
-            # Scroll to trigger lazy loading
-            driver.execute_script("window.scrollTo(0, 1000);")
-            time.sleep(3)
+            # Scroll to trigger lazy loading (scroll multiple times)
+            for _ in range(3):
+                driver.execute_script("window.scrollBy(0, 1000);")
+                time.sleep(2)
             
             # Try multiple selectors for articles
-            articles = driver.find_elements(By.TAG_NAME, "article")
+            articles = driver.find_elements(By.CSS_SELECTOR, "[data-testid='tweet']")
             if not articles:
-                articles = driver.find_elements(By.CSS_SELECTOR, "[data-testid='tweet']")
-            if not articles:
-                 # Fallback for some layouts
-                articles = driver.find_elements(By.CSS_SELECTOR, ".css-1dbjc4n.r-1loqt21.r-18u37iz.r-1ny4l3l.r-1udh08x.r-1qhn6m8.r-i023vh.r-o7ynqc.r-6416eg")
+                articles = driver.find_elements(By.TAG_NAME, "article")
 
             logger.info(f"Found {len(articles)} articles")
+            if not articles:
+                driver.save_screenshot(f"debug_twitter_{username}_no_articles.png")
+                with open(f"debug_twitter_{username}.html", "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
             
             for article in articles:
                 try:
+                    # Scroll into view to ensure text renders
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", article)
+                    
                     # Try to extract text - prioritized selectors
                     text = ""
                     text_element = None
                     try:
                         text_element = article.find_element(By.CSS_SELECTOR, "[data-testid='tweetText']")
                     except:
-                        try:
-                            text_element = article.find_element(By.XPATH, ".//div[@lang]")
-                        except:
-                            pass
+                        pass
                     
                     if text_element:
                         text = text_element.text
@@ -178,7 +204,7 @@ class LinkedInScraper(ScraperIntegration):
         # LinkedIn public profiles often block scraping.
         # This is a best-effort attempt.
         username = credentials.get("username")
-        driver = self._get_driver()
+        driver = self._get_driver(f"linkedin_{username}")
         posts = []
         try:
             # Try to go to recent activity if public
@@ -192,14 +218,35 @@ class LinkedInScraper(ScraperIntegration):
                  logger.warning("LinkedIn Auth Wall detected. Please log in manually.")
                  time.sleep(15)
             
-            # Check for feed items
-            items = driver.find_elements(By.CLASS_NAME, "feed-shared-update-v2")
+            # Check for feed items (updated selectors 2024/2025)
+            # LinkedIn DOM is very complex and dynamic.
+            
+            # Try scrolling first
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(2)
+
+            selectors = [
+                ".feed-shared-update-v2",
+                "div[data-urn]",
+                ".occludable-update"
+            ]
+            
+            items = []
+            for sel in selectors:
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                if found:
+                    items = found
+                    break
+            
             if not items:
-                # Try main profile
-                url = f"https://www.linkedin.com/in/{username}"
-                driver.get(url)
-                time.sleep(5)
-                items = driver.find_elements(By.CLASS_NAME, "feed-shared-update-v2")
+                logger.warning("No LinkedIn items found with standard selectors.")
+                driver.save_screenshot(f"debug_linkedin_{username}_fail.png")
+                # Try main profile if activity failed
+                if "recent-activity" in driver.current_url:
+                     logger.info("Redirecting to main profile to try fetching posts there...")
+                     driver.get(f"https://www.linkedin.com/in/{username}")
+                     time.sleep(5)
+                     items = driver.find_elements(By.CSS_SELECTOR, ".feed-shared-update-v2")
             
             # Parse found items
             for item in items[:5]:
@@ -233,7 +280,7 @@ class InstagramScraper(ScraperIntegration):
     
     def fetch_posts(self, credentials: Dict[str, str]) -> List[Dict[str, Any]]:
         username = credentials.get("username")
-        driver = self._get_driver()
+        driver = self._get_driver(f"instagram_{username}")
         posts = []
         try:
             url = f"https://www.instagram.com/{username}/"

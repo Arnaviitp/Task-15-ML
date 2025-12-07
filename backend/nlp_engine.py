@@ -283,7 +283,7 @@ class CommentGenerator:
         }
 
     def generate_comment(self, content: str, tone: str = "casual", length: str = "medium", 
-                        include_question: bool = False, platform: str = "default"):
+                        include_question: bool = False, platform: str = "default", custom_templates: dict = None):
         """
         Generate a context-aware, platform-specific comment.
         """
@@ -308,9 +308,17 @@ class CommentGenerator:
         sentiment_category = analysis["sentiment_category"]
         platform_key = platform.lower() if platform.lower() in self.templates else "default"
         
-        # Get platform-specific templates
-        platform_templates = self.templates.get(platform_key, self.templates["default"])
-        templates = platform_templates.get(tone, platform_templates.get("casual", self.templates["default"]["casual"]))
+        # Use custom templates if provided (from Persona), else use default platform templates
+        if custom_templates and platform_key in custom_templates:
+            templates = custom_templates[platform_key].get(tone, custom_templates[platform_key].get("casual", []))
+            if not templates:
+                # Fallback to default if custom templates are empty for this tone
+                platform_templates = self.templates.get(platform_key, self.templates["default"])
+                templates = platform_templates.get(tone, platform_templates.get("casual", self.templates["default"]["casual"]))
+        else:
+            # Get platform-specific templates
+            platform_templates = self.templates.get(platform_key, self.templates["default"])
+            templates = platform_templates.get(tone, platform_templates.get("casual", self.templates["default"]["casual"]))
         
         # Select and format template
         base_comment = random.choice(templates).format(topic=topic)
@@ -410,4 +418,310 @@ class CommentGenerator:
         return {
             "valid": len(issues) == 0,
             "issues": issues
+        }
+    
+    def predict_engagement(self, comment: str, post_content: str, platform: str = "default") -> dict:
+        """
+        Predict how well a comment might perform based on various factors.
+        Returns engagement score (0-100) and breakdown.
+        """
+        score = 50  # Base score
+        factors = {}
+        
+        # Factor 1: Comment length optimization
+        word_count = len(comment.split())
+        if 15 <= word_count <= 50:
+            score += 10
+            factors["length"] = {"score": 10, "reason": "Optimal length for engagement"}
+        elif word_count < 10:
+            score -= 5
+            factors["length"] = {"score": -5, "reason": "Too short - may seem low effort"}
+        elif word_count > 100:
+            score -= 10
+            factors["length"] = {"score": -10, "reason": "Too long - may not be read fully"}
+        else:
+            factors["length"] = {"score": 0, "reason": "Acceptable length"}
+        
+        # Factor 2: Sentiment alignment with post
+        post_blob = TextBlob(post_content)
+        comment_blob = TextBlob(comment)
+        sentiment_diff = abs(post_blob.sentiment.polarity - comment_blob.sentiment.polarity)
+        
+        if sentiment_diff < 0.3:
+            score += 15
+            factors["sentiment_match"] = {"score": 15, "reason": "Sentiment aligns well with post"}
+        elif sentiment_diff > 0.6:
+            score -= 10
+            factors["sentiment_match"] = {"score": -10, "reason": "Sentiment misaligned with post"}
+        else:
+            factors["sentiment_match"] = {"score": 0, "reason": "Neutral sentiment alignment"}
+        
+        # Factor 3: Contains question (drives conversation)
+        if "?" in comment:
+            score += 10
+            factors["question"] = {"score": 10, "reason": "Contains question - encourages replies"}
+        else:
+            factors["question"] = {"score": 0, "reason": "No question included"}
+        
+        # Factor 4: Emoji usage (platform-dependent)
+        emoji_count = len(re.findall(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]', comment))
+        if platform.lower() in ["instagram", "twitter"]:
+            if 1 <= emoji_count <= 3:
+                score += 8
+                factors["emoji"] = {"score": 8, "reason": "Good emoji usage for this platform"}
+            elif emoji_count > 5:
+                score -= 5
+                factors["emoji"] = {"score": -5, "reason": "Too many emojis"}
+            else:
+                factors["emoji"] = {"score": 0, "reason": "Consider adding 1-3 relevant emojis"}
+        elif platform.lower() == "linkedin":
+            if emoji_count == 0 or emoji_count == 1:
+                score += 5
+                factors["emoji"] = {"score": 5, "reason": "Professional emoji usage"}
+            elif emoji_count > 2:
+                score -= 5
+                factors["emoji"] = {"score": -5, "reason": "Too many emojis for LinkedIn"}
+            else:
+                factors["emoji"] = {"score": 0, "reason": "Acceptable emoji usage"}
+        else:
+            factors["emoji"] = {"score": 0, "reason": "Emoji not factored"}
+        
+        # Factor 5: Personalization (mentions post-specific topics)
+        post_doc = nlp(post_content.lower())
+        comment_doc = nlp(comment.lower())
+        
+        post_keywords = set([token.lemma_ for token in post_doc if token.pos_ in ["NOUN", "PROPN", "VERB"]])
+        comment_keywords = set([token.lemma_ for token in comment_doc if token.pos_ in ["NOUN", "PROPN", "VERB"]])
+        
+        overlap = post_keywords.intersection(comment_keywords)
+        if len(overlap) >= 2:
+            score += 12
+            factors["relevance"] = {"score": 12, "reason": f"References post topics: {', '.join(list(overlap)[:3])}"}
+        elif len(overlap) == 1:
+            score += 5
+            factors["relevance"] = {"score": 5, "reason": "Some topic relevance"}
+        else:
+            score -= 5
+            factors["relevance"] = {"score": -5, "reason": "Could be more specific to post content"}
+        
+        # Clamp score
+        score = max(0, min(100, score))
+        
+        # Generate recommendation
+        if score >= 80:
+            recommendation = "Excellent! This comment is likely to perform very well."
+        elif score >= 60:
+            recommendation = "Good comment with room for minor improvements."
+        elif score >= 40:
+            recommendation = "Average potential. Consider the suggestions below."
+        else:
+            recommendation = "This comment may not engage well. Review the factors."
+        
+        return {
+            "score": score,
+            "factors": factors,
+            "recommendation": recommendation
+        }
+    
+    def suggest_emojis(self, content: str, platform: str = "default", count: int = 5) -> list:
+        """
+        Suggest relevant emojis based on content sentiment and topics.
+        """
+        blob = TextBlob(content)
+        doc = nlp(content)
+        sentiment = blob.sentiment.polarity
+        
+        # Emotion-based emojis
+        emotion_emojis = {
+            "very_positive": ["🎉", "🚀", "✨", "💯", "🔥", "🙌", "💪", "⭐", "🌟", "💎"],
+            "positive": ["😊", "👍", "❤️", "💕", "🙏", "👏", "✅", "💡", "🌈", "☀️"],
+            "neutral": ["💭", "📌", "📊", "💼", "📈", "🎯", "⚡", "💻", "📱", "🔗"],
+            "negative": ["😔", "💔", "🙁", "😢", "🤔", "❓", "⚠️", "😕", "🧐", "💬"],
+            "very_negative": ["😢", "💔", "🙏", "❤️‍🩹", "🫂", "💙", "🕊️", "🌹", "🤗", "💗"]
+        }
+        
+        # Topic-based emojis
+        topic_emojis = {
+            "tech": ["💻", "🖥️", "📱", "🤖", "⚙️", "🔧", "💾", "🌐"],
+            "business": ["💼", "📊", "📈", "🏢", "💰", "🤝", "📋", "💵"],
+            "travel": ["✈️", "🌍", "🏖️", "🗺️", "🌴", "🏔️", "🚗", "🌅"],
+            "food": ["🍕", "🍔", "☕", "🍳", "🍜", "🥗", "🍰", "🍷"],
+            "fitness": ["💪", "🏋️", "🏃", "🧘", "🚴", "🏊", "⚽", "🎾"],
+            "celebration": ["🎉", "🎊", "🥳", "🎂", "🍾", "🎈", "🏆", "🎁"],
+            "nature": ["🌿", "🌸", "🌻", "🌲", "🌊", "🦋", "🌺", "🍃"],
+            "love": ["❤️", "💕", "💗", "💖", "🥰", "😍", "💝", "💞"]
+        }
+        
+        # Determine sentiment category
+        if sentiment > 0.5:
+            sent_cat = "very_positive"
+        elif sentiment > 0.1:
+            sent_cat = "positive"
+        elif sentiment > -0.1:
+            sent_cat = "neutral"
+        elif sentiment > -0.5:
+            sent_cat = "negative"
+        else:
+            sent_cat = "very_negative"
+        
+        suggested = set()
+        
+        # Add sentiment-based emojis
+        sentiment_picks = emotion_emojis.get(sent_cat, emotion_emojis["neutral"])[:3]
+        suggested.update(sentiment_picks)
+        
+        # Add topic-based emojis
+        content_lower = content.lower()
+        for topic, emojis in topic_emojis.items():
+            topic_keywords = {
+                "tech": ["ai", "software", "code", "developer", "technology", "app", "data", "machine learning"],
+                "business": ["business", "company", "startup", "enterprise", "growth", "revenue", "sales"],
+                "travel": ["travel", "trip", "vacation", "destination", "flight", "hotel", "adventure"],
+                "food": ["food", "restaurant", "cooking", "recipe", "chef", "delicious", "meal"],
+                "fitness": ["fitness", "gym", "workout", "health", "exercise", "run", "training"],
+                "celebration": ["congrats", "congratulations", "celebrate", "achievement", "milestone", "success"],
+                "nature": ["nature", "outdoor", "garden", "forest", "beach", "mountain", "weather"],
+                "love": ["love", "heart", "romantic", "relationship", "together", "forever"]
+            }
+            
+            if any(kw in content_lower for kw in topic_keywords.get(topic, [])):
+                suggested.update(emojis[:2])
+        
+        # Platform-specific filtering
+        if platform.lower() == "linkedin":
+            # Keep it professional
+            professional = ["💼", "📊", "📈", "🚀", "💡", "✨", "🎯", "👏", "🙏", "💪", "🎉", "✅"]
+            suggested = {e for e in suggested if e in professional}
+            if not suggested:
+                suggested = {"💼", "📈", "🎯"}
+        
+        return list(suggested)[:count]
+    
+    def generate_hashtags(self, content: str, platform: str = "default", count: int = 5) -> list:
+        """
+        Generate relevant hashtags based on content analysis.
+        """
+        doc = nlp(content)
+        
+        # Extract entities and noun phrases
+        entities = [ent.text.replace(" ", "") for ent in doc.ents if ent.label_ in ["ORG", "PRODUCT", "GPE", "EVENT", "WORK_OF_ART"]]
+        nouns = [chunk.root.lemma_ for chunk in doc.noun_chunks if len(chunk.root.text) > 3]
+        
+        # Common trending hashtag patterns
+        trending_patterns = {
+            "linkedin": ["Networking", "Leadership", "Innovation", "CareerGrowth", "ProfessionalDevelopment", 
+                        "Entrepreneurship", "BusinessStrategy", "DigitalTransformation"],
+            "twitter": ["Trending", "BreakingNews", "MustRead", "HotTake", "ThreadTime"],
+            "instagram": ["InstaDaily", "PhotoOfTheDay", "Vibes", "Aesthetic", "Goals", "Mood"]
+        }
+        
+        hashtags = set()
+        
+        # Add entity-based hashtags
+        for entity in entities[:3]:
+            hashtags.add(f"#{entity.title()}")
+        
+        # Add noun-based hashtags
+        for noun in nouns[:3]:
+            clean = noun.replace(" ", "").title()
+            if len(clean) > 2:
+                hashtags.add(f"#{clean}")
+        
+        # Add platform-specific trending hashtags
+        platform_key = platform.lower() if platform.lower() in trending_patterns else "linkedin"
+        platform_hashtags = trending_patterns[platform_key]
+        
+        # Add 1-2 trending ones
+        import random as rnd
+        selected_trending = rnd.sample(platform_hashtags, min(2, len(platform_hashtags)))
+        for tag in selected_trending:
+            hashtags.add(f"#{tag}")
+        
+        return list(hashtags)[:count]
+    
+    def get_optimal_posting_times(self, platform: str = "default") -> dict:
+        """
+        Returns optimal posting times based on platform and day of week.
+        """
+        # Industry research-based optimal times (in local timezone)
+        optimal_times = {
+            "linkedin": {
+                "best_days": ["Tuesday", "Wednesday", "Thursday"],
+                "best_hours": ["7:00 AM", "8:00 AM", "12:00 PM", "5:00 PM", "6:00 PM"],
+                "worst_times": ["Saturday", "Sunday", "Late night (10 PM - 5 AM)"],
+                "insights": "LinkedIn users are most active during work hours, especially mid-week. Avoid weekends."
+            },
+            "twitter": {
+                "best_days": ["Wednesday", "Friday"],
+                "best_hours": ["9:00 AM", "12:00 PM", "3:00 PM", "6:00 PM"],
+                "worst_times": ["Late night (1 AM - 5 AM)"],
+                "insights": "Twitter engagement peaks during lunch breaks and commute times. Fridays see high engagement."
+            },
+            "instagram": {
+                "best_days": ["Monday", "Tuesday", "Wednesday"],
+                "best_hours": ["11:00 AM", "1:00 PM", "7:00 PM", "9:00 PM"],
+                "worst_times": ["3 AM - 6 AM"],
+                "insights": "Instagram users are most active during lunch and evening. Visual content performs best."
+            },
+            "facebook": {
+                "best_days": ["Wednesday", "Thursday", "Friday"],
+                "best_hours": ["9:00 AM", "1:00 PM", "3:00 PM"],
+                "worst_times": ["Early morning (before 7 AM)"],
+                "insights": "Facebook engagement is highest mid-week. Thursdays and Fridays see 18% more engagement."
+            },
+            "default": {
+                "best_days": ["Tuesday", "Wednesday", "Thursday"],
+                "best_hours": ["9:00 AM", "12:00 PM", "6:00 PM"],
+                "worst_times": ["Late night", "Early morning"],
+                "insights": "General best practice: Post during work hours on weekdays for professional content."
+            }
+        }
+        
+        platform_key = platform.lower() if platform.lower() in optimal_times else "default"
+        return optimal_times[platform_key]
+    
+    def enhance_comment(self, comment: str, platform: str = "default", add_emojis: bool = True, 
+                       add_hashtags: bool = False, engagement_boost: bool = True) -> dict:
+        """
+        Apply multiple enhancements to a comment at once.
+        """
+        enhanced = comment
+        enhancements_applied = []
+        
+        # Add emojis if requested
+        if add_emojis:
+            emojis = self.suggest_emojis(comment, platform, count=2)
+            if emojis:
+                # Add emoji at start or end based on platform
+                if platform.lower() == "linkedin":
+                    enhanced = f"{emojis[0]} {enhanced}"
+                else:
+                    enhanced = f"{enhanced} {''.join(emojis)}"
+                enhancements_applied.append("emojis")
+        
+        # Add hashtags if requested
+        if add_hashtags:
+            hashtags = self.generate_hashtags(comment, platform, count=3)
+            if hashtags:
+                enhanced = f"{enhanced}\n\n{' '.join(hashtags)}"
+                enhancements_applied.append("hashtags")
+        
+        # Engagement boost - add conversation starter if not present
+        if engagement_boost and "?" not in enhanced:
+            starters = [
+                "\n\nWhat do you think?",
+                "\n\nWould love to hear your thoughts!",
+                "\n\nAnyone else feel the same way?"
+            ]
+            enhanced += random.choice(starters)
+            enhancements_applied.append("engagement_boost")
+        
+        # Get engagement prediction
+        prediction = self.predict_engagement(enhanced, comment, platform)
+        
+        return {
+            "original": comment,
+            "enhanced": enhanced,
+            "enhancements_applied": enhancements_applied,
+            "engagement_prediction": prediction
         }

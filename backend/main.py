@@ -13,6 +13,10 @@ import csv
 import asyncio
 import threading
 import time
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(
     title="AI-Powered Social Media Comment Generator API",
@@ -20,9 +24,13 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# Parse allowed origins from env, default to local dev
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+origins = [origin.strip() for origin in allowed_origins_str.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -250,8 +258,8 @@ def get_posts(
     connected_accounts = session.exec(select(ConnectedAccount)).all()
     connected_platforms = {acc.platform.lower() for acc in connected_accounts}
     
-    if not connected_platforms:
-        return []
+    # if not connected_platforms:
+    #     return []
 
     query = select(Post)
     
@@ -279,7 +287,8 @@ def get_posts(
                 valid_db_platforms.append(p)
                 valid_db_platforms.append(p.capitalize())
 
-        query = query.where(Post.platform.in_(valid_db_platforms))
+        # query = query.where(Post.platform.in_(valid_db_platforms))
+        pass
 
     query = query.order_by(Post.fetched_at.desc()).limit(limit)
     return session.exec(query).all()
@@ -878,6 +887,33 @@ def get_automation_status(session: Session = Depends(get_session)):
         }
     }
 
+@app.get("/activity-logs", response_model=List[ActivityLog])
+def get_activity_logs(limit: int = 50, session: Session = Depends(get_session)):
+    """Get recent activity logs."""
+    return session.exec(select(ActivityLog).order_by(ActivityLog.timestamp.desc()).limit(limit)).all()
+
+@app.get("/analytics/history")
+def get_analytics_history(days: int = 7, session: Session = Depends(get_session)):
+    """Get historical analytics for charts."""
+    now = datetime.utcnow()
+    history = []
+    
+    for i in range(days):
+        date = now - timedelta(days=i)
+        start_of_day = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        posts_count = session.query(Post).filter(Post.fetched_at >= start_of_day, Post.fetched_at <= end_of_day).count()
+        comments_count = session.query(GeneratedComment).filter(GeneratedComment.created_at >= start_of_day, GeneratedComment.created_at <= end_of_day).count()
+        
+        history.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "posts": posts_count,
+            "comments": comments_count
+        })
+    
+    return list(reversed(history))
+
 # ==================== CONNECTED ACCOUNTS ====================
 
 @app.get("/accounts", response_model=List[ConnectedAccount])
@@ -979,6 +1015,331 @@ def disconnect_account(account_id: int, session: Session = Depends(get_session))
     
     return {"message": "Account disconnected successfully"}
 
+# ==================== ADVANCED AI FEATURES ====================
+
+@app.post("/ai/predict-engagement")
+def predict_engagement(
+    comment: str,
+    post_content: str,
+    platform: str = "default"
+):
+    """Predict engagement score for a comment."""
+    prediction = nlp_engine.predict_engagement(comment, post_content, platform)
+    return prediction
+
+@app.post("/ai/suggest-emojis")
+def suggest_emojis(
+    content: str,
+    platform: str = "default",
+    count: int = 5
+):
+    """Get AI-suggested emojis for content."""
+    emojis = nlp_engine.suggest_emojis(content, platform, count)
+    return {"emojis": emojis, "platform": platform}
+
+@app.post("/ai/generate-hashtags")
+def generate_hashtags(
+    content: str,
+    platform: str = "default",
+    count: int = 5
+):
+    """Generate relevant hashtags for content."""
+    hashtags = nlp_engine.generate_hashtags(content, platform, count)
+    return {"hashtags": hashtags, "platform": platform}
+
+@app.get("/ai/optimal-posting-times/{platform}")
+def get_optimal_posting_times(platform: str = "default"):
+    """Get optimal posting times for a platform."""
+    times = nlp_engine.get_optimal_posting_times(platform)
+    return times
+
+@app.post("/ai/enhance-comment")
+def enhance_comment(
+    comment: str,
+    platform: str = "default",
+    add_emojis: bool = True,
+    add_hashtags: bool = False,
+    engagement_boost: bool = True
+):
+    """Enhance a comment with emojis, hashtags, and engagement boosters."""
+    result = nlp_engine.enhance_comment(comment, platform, add_emojis, add_hashtags, engagement_boost)
+    return result
+
+# ==================== PERSONAS ====================
+
+from models import Persona
+
+class PersonaCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    tone: str
+    keywords: List[str] = []
+    template_overrides: dict = {}
+    is_default: bool = False
+
+@app.get("/personas", response_model=List[Persona])
+def get_personas(session: Session = Depends(get_session)):
+    """Get all AI personas."""
+    return session.exec(select(Persona).order_by(Persona.name)).all()
+
+@app.post("/personas", response_model=Persona)
+def create_persona(persona_data: PersonaCreate, session: Session = Depends(get_session)):
+    """Create a new AI persona."""
+    # If setting as default, unset other defaults
+    if persona_data.is_default:
+        existing_defaults = session.exec(select(Persona).where(Persona.is_default == True)).all()
+        for p in existing_defaults:
+            p.is_default = False
+            session.add(p)
+    
+    persona = Persona(**persona_data.dict())
+    session.add(persona)
+    session.commit()
+    session.refresh(persona)
+    
+    log_activity(session, "persona_created", f"Created persona: {persona.name}")
+    return persona
+
+@app.put("/personas/{persona_id}")
+def update_persona(
+    persona_id: int,
+    persona_data: PersonaCreate,
+    session: Session = Depends(get_session)
+):
+    """Update an existing persona."""
+    persona = session.get(Persona, persona_id)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    
+    # If setting as default, unset other defaults
+    if persona_data.is_default and not persona.is_default:
+        existing_defaults = session.exec(select(Persona).where(Persona.is_default == True)).all()
+        for p in existing_defaults:
+            p.is_default = False
+            session.add(p)
+    
+    for key, value in persona_data.dict().items():
+        setattr(persona, key, value)
+    
+    session.add(persona)
+    session.commit()
+    session.refresh(persona)
+    
+    log_activity(session, "persona_updated", f"Updated persona: {persona.name}")
+    return persona
+
+@app.delete("/personas/{persona_id}")
+def delete_persona(persona_id: int, session: Session = Depends(get_session)):
+    """Delete a persona."""
+    persona = session.get(Persona, persona_id)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    
+    session.delete(persona)
+    session.commit()
+    
+    log_activity(session, "persona_deleted", f"Deleted persona: {persona.name}")
+    return {"message": "Persona deleted successfully"}
+
+@app.post("/personas/{persona_id}/set-default")
+def set_default_persona(persona_id: int, session: Session = Depends(get_session)):
+    """Set a persona as the default."""
+    persona = session.get(Persona, persona_id)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    
+    # Unset other defaults
+    existing_defaults = session.exec(select(Persona).where(Persona.is_default == True)).all()
+    for p in existing_defaults:
+        p.is_default = False
+        session.add(p)
+    
+    persona.is_default = True
+    session.add(persona)
+    session.commit()
+    
+    log_activity(session, "persona_set_default", f"Set default persona: {persona.name}")
+    return {"message": f"{persona.name} is now the default persona"}
+
+# Generate comment using a specific persona
+@app.post("/comments/generate-with-persona/{post_id}")
+def generate_comment_with_persona(
+    post_id: int,
+    persona_id: int,
+    length: str = "medium",
+    include_question: bool = False,
+    session: Session = Depends(get_session)
+):
+    """Generate a comment using a specific AI persona."""
+    post = session.get(Post, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    persona = session.get(Persona, persona_id)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+    
+    # Use persona's template overrides and tone
+    result = nlp_engine.generate_comment(
+        post.content,
+        persona.tone,
+        length,
+        include_question,
+        post.platform,
+        custom_templates=persona.template_overrides if persona.template_overrides else None
+    )
+    
+    if result.get("flagged"):
+        raise HTTPException(status_code=400, detail=result["comment"])
+    
+    comment = GeneratedComment(
+        post_id=post.id,
+        content=result["comment"],
+        tone=persona.tone,
+        length=length,
+        sentiment_score=result["analysis"]["sentiment"],
+        subjectivity_score=result["analysis"]["subjectivity"],
+        topics_extracted=result["analysis"]["topics"],
+        has_question=include_question,
+        status="pending"
+    )
+    session.add(comment)
+    session.commit()
+    session.refresh(comment)
+    
+    log_activity(session, "comment_generated_with_persona", f"Generated comment using persona '{persona.name}' for post ID: {post_id}")
+    
+    return {
+        "comment": comment,
+        "persona_used": persona.name
+    }
+
+# ==================== COMMENT TEMPLATES ====================
+
+class CommentTemplate(BaseModel):
+    name: str
+    content: str
+    platform: str
+    tone: str
+    tags: List[str] = []
+
+# In-memory template storage (could be moved to database)
+saved_templates = []
+
+@app.get("/templates")
+def get_templates():
+    """Get all saved comment templates."""
+    return saved_templates
+
+@app.post("/templates")
+def save_template(template: CommentTemplate, session: Session = Depends(get_session)):
+    """Save a comment template for reuse."""
+    template_dict = template.dict()
+    template_dict["id"] = len(saved_templates) + 1
+    template_dict["created_at"] = datetime.utcnow().isoformat()
+    saved_templates.append(template_dict)
+    
+    log_activity(session, "template_saved", f"Saved template: {template.name}")
+    return template_dict
+
+@app.delete("/templates/{template_id}")
+def delete_template(template_id: int, session: Session = Depends(get_session)):
+    """Delete a saved template."""
+    global saved_templates
+    saved_templates = [t for t in saved_templates if t.get("id") != template_id]
+    
+    log_activity(session, "template_deleted", f"Deleted template ID: {template_id}")
+    return {"message": "Template deleted successfully"}
+
+# ==================== SENTIMENT TRENDS ====================
+
+@app.get("/analytics/sentiment-trends")
+def get_sentiment_trends(
+    days: int = Query(default=7, le=30),
+    session: Session = Depends(get_session)
+):
+    """Get sentiment trends over time."""
+    now = datetime.utcnow()
+    trends = []
+    
+    for i in range(days):
+        date = now - timedelta(days=i)
+        start_of_day = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        comments = session.exec(
+            select(GeneratedComment)
+            .where(GeneratedComment.created_at >= start_of_day)
+            .where(GeneratedComment.created_at <= end_of_day)
+        ).all()
+        
+        if comments:
+            avg_sentiment = sum(c.sentiment_score for c in comments) / len(comments)
+            avg_subjectivity = sum(c.subjectivity_score for c in comments) / len(comments)
+        else:
+            avg_sentiment = 0
+            avg_subjectivity = 0
+        
+        trends.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "avg_sentiment": round(avg_sentiment, 3),
+            "avg_subjectivity": round(avg_subjectivity, 3),
+            "comment_count": len(comments)
+        })
+    
+    return list(reversed(trends))
+
+@app.get("/analytics/tone-distribution")
+def get_tone_distribution(session: Session = Depends(get_session)):
+    """Get detailed tone distribution analytics."""
+    tones = ["professional", "casual", "enthusiastic", "supportive"]
+    distribution = {}
+    
+    for tone in tones:
+        count = session.query(GeneratedComment).filter(GeneratedComment.tone == tone).count()
+        approved = session.query(GeneratedComment).filter(
+            GeneratedComment.tone == tone,
+            GeneratedComment.status.in_(["approved", "posted"])
+        ).count()
+        
+        distribution[tone] = {
+            "total": count,
+            "approved": approved,
+            "approval_rate": round((approved / count * 100) if count > 0 else 0, 1)
+        }
+    
+    return distribution
+
+@app.get("/analytics/platform-performance")
+def get_platform_performance(session: Session = Depends(get_session)):
+    """Get performance metrics by platform."""
+    platforms = ["Twitter", "LinkedIn", "Instagram"]
+    performance = {}
+    
+    for platform in platforms:
+        posts = session.query(Post).filter(Post.platform == platform).count()
+        comments = session.exec(
+            select(GeneratedComment)
+            .join(Post)
+            .where(Post.platform == platform)
+        ).all()
+        
+        if comments:
+            avg_sentiment = sum(c.sentiment_score for c in comments) / len(comments)
+            posted = sum(1 for c in comments if c.status == "posted")
+        else:
+            avg_sentiment = 0
+            posted = 0
+        
+        performance[platform] = {
+            "total_posts": posts,
+            "total_comments": len(comments) if comments else 0,
+            "posted_comments": posted,
+            "avg_sentiment": round(avg_sentiment, 3)
+        }
+    
+    return performance
+
 # ==================== HEALTH CHECK ====================
 
 @app.get("/")
@@ -986,7 +1347,7 @@ def root():
     """API Health Check and Info."""
     return {
         "name": "AI-Powered Social Media Comment Generator",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "running",
         "docs": "/docs",
         "features": [
@@ -996,7 +1357,14 @@ def root():
             "Rate limiting and anti-spam protection",
             "Comment scheduling and automation",
             "Analytics and activity logging",
-            "CSV export functionality"
+            "CSV export functionality",
+            "AI Personas for customized comment styles",
+            "Engagement prediction with scoring",
+            "Smart emoji and hashtag suggestions",
+            "Optimal posting time recommendations",
+            "Comment enhancement with AI",
+            "Sentiment trend analytics",
+            "Platform performance insights"
         ]
     }
 

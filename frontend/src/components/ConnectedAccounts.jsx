@@ -243,7 +243,7 @@ const ConnectedAccounts = () => {
 
                         <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem', fontSize: '0.9rem' }}>
                             {formData.mode === 'simulation' && "Enter a username to simulate a connection with mock data."}
-                            {formData.mode === 'scraper' && "Uses an automated browser to visit the public profile. No API key needed. (Note: May require manual login in the opened window)."}
+                            {formData.mode === 'scraper' && "Uses an automated browser (Selenium). Your login session will be saved, so you only need to log in manually once per account."}
                             {formData.mode === 'api' && "Enter your API Access Token. The app will fetch your real posts."}
                         </p>
 

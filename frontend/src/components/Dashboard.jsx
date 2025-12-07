@@ -42,34 +42,32 @@ const Dashboard = () => {
         setLoading(true);
         setCheckingAccounts(true);
         try {
+            console.log("Fetching accounts...");
             const accounts = await getConnectedAccounts();
+            console.log("Accounts fetched:", accounts);
             setConnectedAccounts(accounts);
 
-            // Only fetch posts if there are connected accounts
-            if (accounts.length > 0) {
-                let currentPosts = await getPosts();
+            // Removing the conditional check to force load posts even if accounts list seems empty (for debug)
+            // if (accounts.length > 0) {
+            console.log("Fetching posts...");
+            let currentPosts = await getPosts();
+            console.log("Posts fetched:", currentPosts);
 
-                // If no posts in DB, try auto-fetching
-                if (currentPosts.length === 0) {
-                    info("Initialize feed: Fetching posts from connected accounts...");
-                    try {
-                        await fetchPosts();
-                        currentPosts = await getPosts();
-                        if (currentPosts.length > 0) {
-                            success("Posts fetched successfully!");
-                        }
-                    } catch (err) {
-                        console.error("Auto-fetch failed:", err);
-                        // Don't show error to user immediately, let them use manual button
-                    }
-                }
-                setPosts(currentPosts);
+            if (currentPosts.length === 0) {
+                info("No posts found in database. You might want to 'Fetch New Posts'.");
+                // Optional: Auto fetch attempt
+                // await fetchPosts().catch(err => console.error("Auto-fetch error", err));
             } else {
-                setPosts([]);
+                setPosts(currentPosts);
+                success(`Loaded ${currentPosts.length} posts from database.`);
             }
+            // } else {
+            //    setPosts([]);
+            //    warning("No connected accounts found.");
+            // }
         } catch (err) {
             console.error("Error initializing dashboard:", err);
-            error("Failed to load dashboard data");
+            error(`Failed to load data: ${err.message}`);
         } finally {
             setLoading(false);
             setCheckingAccounts(false);
@@ -136,11 +134,14 @@ const Dashboard = () => {
         if (!manualPost.content) return;
         setLoading(true);
         try {
+            const hashtags = (manualPost.content.match(/#(\w+)/g) || []).map(h => h.slice(1));
+            const mentions = (manualPost.content.match(/@(\w+)/g) || []).map(m => m.slice(1));
+
             await createPost({
                 ...manualPost,
                 url: manualPost.url || `manual-${Date.now()}`,
-                hashtags: manualPost.content.match(/#(\w+)/g)?.map(h => h.slice(1)) || [],
-                mentions: manualPost.content.match(/@(\w+)/g)?.map(m => m.slice(1)) || []
+                hashtags,
+                mentions
             });
             setManualPost({ platform: 'Twitter', content: '', author: 'User', url: '' });
             setShowManualForm(false);
@@ -181,7 +182,14 @@ const Dashboard = () => {
                     <h2 style={{ margin: 0, marginBottom: '0.5rem' }}>📊 Active Posts</h2>
                     <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
                         Analyze and engage with social media content. {posts.length} posts loaded.
+                        (Accounts: {connectedAccounts.length})
                     </p>
+                    {/* DEBUG INFO */}
+                    <div style={{ fontSize: '0.7rem', color: '#888', marginTop: '0.5rem' }}>
+                        Debug: Posts={posts.length}, Accounts={connectedAccounts.length}
+                        <br />
+                        First Post: {posts.length > 0 ? JSON.stringify(posts[0].platform) : 'None'}
+                    </div>
                 </div>
                 <div style={{ display: 'flex', gap: '0.75rem' }}>
                     <button className="btn btn-secondary" onClick={() => setShowManualForm(!showManualForm)}>

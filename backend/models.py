@@ -69,3 +69,15 @@ class ConnectedAccount(SQLModel, table=True):
     last_used_at: Optional[datetime] = Field(default=None)
     platform_metadata: dict = Field(default={}, sa_column=Column(JSON))  # Platform-specific data
 
+class Persona(SQLModel, table=True):
+    """Custom AI Personalities for comment generation."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    description: Optional[str] = None
+    tone: str  # maps to underlying tone in NLP engine or overrides it
+    keywords: List[str] = Field(default=[], sa_column=Column(JSON))  # Keywords to emphasize
+    template_overrides: dict = Field(default={}, sa_column=Column(JSON))  # Custom templates per platform
+    is_active: bool = Field(default=True)
+    is_default: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+

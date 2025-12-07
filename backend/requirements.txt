@@ -11,3 +11,6 @@ transformers
 torch
 better_profanity
 webdriver-manager
+python-dotenv
+requests
+httpx
