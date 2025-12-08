@@ -74,8 +74,10 @@ DEFAULT_SETTINGS = {
     "rate_limit_per_hour": "15",
     "min_delay_seconds": "60",
     "max_delay_seconds": "120",
+    "auto_fetch_enabled": "false",
     "auto_generate_enabled": "false",
     "auto_post_enabled": "false",
+    "auto_approve_enabled": "false",
     "default_tone": "casual",
     "default_length": "medium",
     "include_questions": "true",
@@ -195,6 +197,7 @@ def fetch_mock_posts():
 class PostFetchResponse(BaseModel):
     count: int
     posts: List[Post]
+    message: Optional[str] = None
 
 @app.post("/posts/fetch", response_model=PostFetchResponse)
 def fetch_posts(session: Session = Depends(get_session)):
@@ -334,12 +337,15 @@ def fetch_posts(session: Session = Depends(get_session)):
     except Exception as e:
         print(f"Error cleaning up old posts: {e}")
     
+    message = None
+    if not connected_platforms:
+        message = "No connected accounts found. Please connect an account in Settings."
+        log_activity(session, "posts_fetch_skipped", message)
+
     if new_posts:
         log_activity(session, "posts_fetched", f"Fetched {len(new_posts)} new posts total")
-    elif not connected_platforms:
-         log_activity(session, "posts_fetch_skipped", "No connected accounts found to fetch posts from")
 
-    return {"count": len(new_posts), "posts": new_posts}
+    return {"count": len(new_posts), "posts": new_posts, "message": message}
 
 @app.get("/posts", response_model=List[Post])
 def get_posts(
@@ -1058,8 +1064,10 @@ def get_automation_status(session: Session = Depends(get_session)):
             "comments_posted": recent_posted
         },
         "automation_settings": {
+            "auto_fetch_enabled": get_setting(session, "auto_fetch_enabled") == "true",
             "auto_generate_enabled": get_setting(session, "auto_generate_enabled") == "true",
-            "auto_post_enabled": get_setting(session, "auto_post_enabled") == "true"
+            "auto_post_enabled": get_setting(session, "auto_post_enabled") == "true",
+            "auto_approve_enabled": get_setting(session, "auto_approve_enabled") == "true"
         }
     }
 
