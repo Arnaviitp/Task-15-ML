@@ -322,6 +322,11 @@ class CommentGenerator:
         
         # Select and format template
         base_comment = random.choice(templates).format(topic=topic)
+
+        # Add context-aware emoji
+        suggested_emojis = self.suggest_emojis(content, platform, count=1)
+        if suggested_emojis and not any(e in base_comment for e in suggested_emojis):
+            base_comment += f" {suggested_emojis[0]}"
         
         # Add sentiment-appropriate prefix
         prefixes = self.sentiment_prefixes.get(sentiment_category, [])

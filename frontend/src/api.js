@@ -200,6 +200,25 @@ export const disconnectAccount = async (accountId) => {
   return response.data;
 };
 
+// ==================== OAUTH ====================
+
+export const getOAuthStatus = async () => {
+  const response = await api.get('/oauth/status');
+  return response.data;
+};
+
+export const initiateOAuth = async (platform) => {
+  const response = await api.get(`/oauth/${platform}/authorize`);
+  return response.data;
+};
+
+export const refreshOAuthToken = async (platform, accountId) => {
+  const response = await api.post(`/oauth/${platform}/refresh`, null, {
+    params: { account_id: accountId }
+  });
+  return response.data;
+};
+
 // ==================== AI FEATURES ====================
 
 export const predictEngagement = async (comment, postContent, platform = 'default') => {

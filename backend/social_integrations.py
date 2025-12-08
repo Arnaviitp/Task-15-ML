@@ -3,6 +3,8 @@ import requests
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
+import praw
+from praw.exceptions import PRAWException
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -25,6 +27,11 @@ class SocialMediaIntegration:
     def validate_token(self, credentials: Dict[str, str]) -> Dict[str, Any]:
         """Validate credentials. For scraping, this usually just checks if we can load a page."""
         return {"valid": True, "username": credentials.get("username"), "method": "scraper"}
+
+    def post_comment(self, credentials: Dict[str, str], post_id: str, content: str) -> Dict[str, Any]:
+        """Post a comment to the platform."""
+        # Default mock implementation for platforms that don't support posting yet or are simulated
+        return {"success": True, "id": f"mock_{int(datetime.utcnow().timestamp())}", "url": f"https://mock.com/comment/{int(datetime.utcnow().timestamp())}", "error": None}
 
 class ScraperIntegration(SocialMediaIntegration):
     """Base class for Selenium-based scraping."""
@@ -578,6 +585,200 @@ class InstagramIntegration(SocialMediaIntegration):
         except Exception as e:
             return {"valid": False, "error": str(e)}
 
+class RedditIntegration(SocialMediaIntegration):
+    """Reddit API Integration using PRAW (Python Reddit API Wrapper)."""
+    
+    def __init__(self):
+        self.reddit = None
+    
+    def _get_reddit_instance(self, credentials: Dict[str, str]):
+        """Initialize and return a Reddit instance."""
+        client_id = credentials.get("client_id")
+        client_secret = credentials.get("client_secret")
+        user_agent = credentials.get("user_agent", "SocialMediaBot/1.0")
+        username = credentials.get("username")
+        password = credentials.get("password")
+        
+        if not client_id or not client_secret:
+            raise ValueError("Reddit API requires client_id and client_secret")
+        
+        if username and password:
+            return praw.Reddit(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=user_agent,
+                username=username,
+                password=password
+            )
+        
+        return praw.Reddit(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent
+        )
+    
+    def fetch_posts(self, credentials: Dict[str, str]) -> List[Dict[str, Any]]:
+        """
+        Fetch hot posts from Reddit.
+        
+        credentials should contain:
+        - client_id: Reddit API client ID
+        - client_secret: Reddit API client secret
+        - user_agent: Custom user agent string (optional, defaults to 'SocialMediaBot/1.0')
+        - subreddit: Subreddit name to fetch from (e.g., 'technology', 'programming')
+        - limit: Number of posts to fetch (optional, defaults to 10)
+        - sort: Sorting method - 'hot', 'new', 'top', 'rising' (optional, defaults to 'hot')
+        """
+        try:
+            reddit = self._get_reddit_instance(credentials)
+            
+            subreddit_name = credentials.get("subreddit", "all")
+            limit = int(credentials.get("limit", 10))
+            sort_method = credentials.get("sort", "hot").lower()
+            
+            subreddit = reddit.subreddit(subreddit_name)
+            
+            # Get posts based on sort method
+            if sort_method == "new":
+                posts_iterator = subreddit.new(limit=limit)
+            elif sort_method == "top":
+                posts_iterator = subreddit.top(limit=limit)
+            elif sort_method == "rising":
+                posts_iterator = subreddit.rising(limit=limit)
+            else:  # Default to hot
+                posts_iterator = subreddit.hot(limit=limit)
+            
+            posts = []
+            for post in posts_iterator:
+                # Get post content - combine title and selftext
+                content = post.title
+                if post.selftext:
+                    content += f"\n\n{post.selftext}"
+                
+                posts.append({
+                    "platform": "Reddit",
+                    "content": content,
+                    "author": str(post.author) if post.author else "[deleted]",
+                    "url": f"https://reddit.com{post.permalink}",
+                    "likes": post.score,  # Reddit uses "score" (upvotes - downvotes)
+                    "comments_count": post.num_comments,
+                    "shares": 0,  # Reddit doesn't have a direct share count
+                    "subreddit": subreddit_name,
+                    "post_id": post.id,
+                    "is_video": post.is_video,
+                    "is_image": hasattr(post, 'post_hint') and post.post_hint == 'image',
+                    "thumbnail": post.thumbnail if post.thumbnail and post.thumbnail.startswith('http') else None,
+                    "created_utc": datetime.utcfromtimestamp(post.created_utc),
+                    "fetched_at": datetime.utcnow()
+                })
+            
+            logger.info(f"Fetched {len(posts)} posts from r/{subreddit_name}")
+            return posts
+            
+        except PRAWException as e:
+            logger.error(f"Reddit PRAW error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Reddit integration error: {e}")
+            return []
+    
+    def fetch_user_posts(self, credentials: Dict[str, str]) -> List[Dict[str, Any]]:
+        """
+        Fetch posts from a specific Reddit user.
+        
+        credentials should contain:
+        - client_id: Reddit API client ID
+        - client_secret: Reddit API client secret
+        - user_agent: Custom user agent string
+        - username: Reddit username to fetch posts from
+        - limit: Number of posts to fetch (optional, defaults to 10)
+        """
+        try:
+            reddit = self._get_reddit_instance(credentials)
+            
+            username = credentials.get("username")
+            if not username:
+                logger.error("No username provided for Reddit user posts")
+                return []
+            
+            limit = int(credentials.get("limit", 10))
+            
+            redditor = reddit.redditor(username)
+            
+            posts = []
+            for submission in redditor.submissions.new(limit=limit):
+                content = submission.title
+                if submission.selftext:
+                    content += f"\n\n{submission.selftext}"
+                
+                posts.append({
+                    "platform": "Reddit",
+                    "content": content,
+                    "author": username,
+                    "url": f"https://reddit.com{submission.permalink}",
+                    "likes": submission.score,
+                    "comments_count": submission.num_comments,
+                    "shares": 0,
+                    "subreddit": str(submission.subreddit),
+                    "post_id": submission.id,
+                    "fetched_at": datetime.utcnow()
+                })
+            
+            logger.info(f"Fetched {len(posts)} posts from u/{username}")
+            return posts
+            
+        except PRAWException as e:
+            logger.error(f"Reddit PRAW error: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Reddit user posts error: {e}")
+            return []
+    
+    def validate_token(self, credentials: Dict[str, str]) -> Dict[str, Any]:
+        """Validate Reddit API credentials."""
+        try:
+            reddit = self._get_reddit_instance(credentials)
+            # Try to access a subreddit to verify credentials work
+            test_sub = reddit.subreddit("test")
+            # This will throw an error if credentials are invalid
+            _ = test_sub.display_name
+            
+            return {
+                "valid": True,
+                "username": credentials.get("username", "anonymous"),
+                "method": "api"
+            }
+        except PRAWException as e:
+            return {"valid": False, "error": f"PRAW Error: {str(e)}"}
+            return {"valid": False, "error": str(e)}
+
+    def post_comment(self, credentials: Dict[str, str], post_id: str, content: str) -> Dict[str, Any]:
+        """
+        Post a comment to a Reddit submission.
+        """
+        try:
+            reddit = self._get_reddit_instance(credentials)
+            # Reddit post IDs from PRAW usually don't have the 't3_' prefix for submission objects,
+            # but sometimes they might. PRAW submission(id=...) expects the ID without prefix usually.
+            # If the stored ID matches the pattern, we use it.
+            
+            submission = reddit.submission(id=post_id)
+            comment = submission.reply(content)
+            
+            return {
+                "success": True,
+                "id": comment.id,
+                "url": f"https://reddit.com{comment.permalink}",
+                "error": None
+            }
+        except PRAWException as e:
+            logger.error(f"Reddit post comment error: {e}")
+            return {"success": False, "error": f"PRAW Error: {str(e)}"}
+        except Exception as e:
+            logger.error(f"Reddit post comment generic error: {e}")
+            return {"success": False, "error": str(e)}
+
+
 # Factory
 class SocialMediaFactory:
     @staticmethod
@@ -605,5 +806,7 @@ class SocialMediaFactory:
             return LinkedInIntegration()
         elif platform == "instagram":
             return InstagramIntegration()
+        elif platform == "reddit":
+            return RedditIntegration()
         else:
             raise ValueError(f"Unsupported platform: {platform}")

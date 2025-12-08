@@ -15,8 +15,26 @@ import threading
 import time
 import os
 from dotenv import load_dotenv
+import secrets
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# OAuth handlers import
+try:
+    from oauth_handlers import get_oauth_handler, OAuthHandler
+    from oauth_config import is_oauth_configured, FRONTEND_URL
+    OAUTH_AVAILABLE = True
+except ImportError:
+    OAUTH_AVAILABLE = False
+    FRONTEND_URL = "http://localhost:5173"
+
+# In-memory OAuth state storage (use Redis in production)
+oauth_states = {}
 
 app = FastAPI(
     title="AI-Powered Social Media Comment Generator API",
@@ -174,7 +192,11 @@ def fetch_mock_posts():
         }
     ]
 
-@app.post("/posts/fetch", response_model=List[Post])
+class PostFetchResponse(BaseModel):
+    count: int
+    posts: List[Post]
+
+@app.post("/posts/fetch", response_model=PostFetchResponse)
 def fetch_posts(session: Session = Depends(get_session)):
     """Fetches posts from social media platforms (Real or Mock)."""
     # Get connected accounts
@@ -186,11 +208,13 @@ def fetch_posts(session: Session = Depends(get_session)):
     # 1. Fetch Real Posts from Connected Accounts
     for account in connected_accounts:
         try:
-            # Determine method based on account data (if it has access_token, use API, else Scraper?)
-            # Actually, we should store the 'method' in ConnectedAccount metadata or deduce it.
-            # Current logic: If access_token starts with "mock_", it is mock.
+            # Determine method based on account data
+            # oauth2 method is stored in platform_metadata
+            # If access_token starts with "mock_", it is mock.
             # If access_token is "scraper", it is scraper.
-            # Else, it is Real API.
+            # Else, it is Real API (including OAuth).
+            
+            is_oauth = account.platform_metadata.get("oauth_method") == "oauth2" if account.platform_metadata else False
             
             method = "api"
             if account.access_token == "scraper":
@@ -198,11 +222,47 @@ def fetch_posts(session: Session = Depends(get_session)):
             elif account.access_token and account.access_token.startswith("mock_token_"):
                  continue # Key handled by mock logic below
             
+            # Auto-refresh OAuth token if expired
+            if is_oauth and account.token_expires_at and OAUTH_AVAILABLE:
+                if datetime.utcnow() >= account.token_expires_at:
+                    logger.info(f"Token expired for {account.platform}:{account.username}, attempting refresh...")
+                    try:
+                        handler = get_oauth_handler(account.platform.lower())
+                        if handler and account.refresh_token:
+                            token_data = handler.refresh_token(account.refresh_token)
+                            if "error" not in token_data:
+                                account.access_token = token_data.get("access_token", account.access_token)
+                                account.refresh_token = token_data.get("refresh_token", account.refresh_token)
+                                if token_data.get("expires_in"):
+                                    account.token_expires_at = datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
+                                account.last_used_at = datetime.utcnow()
+                                session.add(account)
+                                session.commit()
+                                log_activity(session, "token_auto_refreshed", f"Auto-refreshed token for {account.platform}: {account.username}")
+                            else:
+                                logger.warning(f"Token refresh failed for {account.platform}:{account.username}: {token_data.get('error')}")
+                        else:
+                            logger.warning(f"Cannot refresh token for {account.platform}:{account.username} - no refresh token or handler")
+                    except Exception as refresh_err:
+                        logger.error(f"Token refresh error: {refresh_err}")
+            
             integration = SocialMediaFactory.get_integration(account.platform, method=method)
             
             # For scraper, we might not need access_token but we pass what we have
-            creds = {"access_token": account.access_token, "username": account.username}
+            # For Reddit, parse JSON credentials
+            if account.platform.lower() == "reddit":
+                try:
+                    import json
+                    creds = json.loads(account.access_token)
+                except (json.JSONDecodeError, TypeError):
+                    creds = {"access_token": account.access_token, "username": account.username}
+            else:
+                creds = {"access_token": account.access_token, "username": account.username}
             real_posts = integration.fetch_posts(creds)
+            
+            # Update last_used_at
+            account.last_used_at = datetime.utcnow()
+            session.add(account)
             
             for post_data in real_posts:
                 existing = session.exec(select(Post).where(Post.url == post_data["url"])).first()
@@ -212,7 +272,7 @@ def fetch_posts(session: Session = Depends(get_session)):
                     new_posts.append(post)
                     
             if real_posts:
-                log_activity(session, "posts_fetched_real", f"Fetched {len(real_posts)} posts from {account.platform} via {method}")
+                log_activity(session, "posts_fetched_real", f"Fetched {len(real_posts)} posts from {account.platform} via {method}{' (OAuth)' if is_oauth else ''}")
             
         except Exception as e:
             log_activity(session, "posts_fetch_error", f"Error fetching from {account.platform}: {str(e)}")
@@ -239,13 +299,47 @@ def fetch_posts(session: Session = Depends(get_session)):
     session.commit()
     for post in new_posts:
         session.refresh(post)
+
+    # Cleanup: Remove older posts to keep the feed fresh
+    # We keep the latest 50 posts per platform and delete the rest (unless they have comments)
+    try:
+        LIMIT_PER_PLATFORM = 50
+        for platform in connected_platforms:
+            # Get posts for this platform, ordered newest first
+            # Note: ilike ensures case-insensitive matching
+            posts = session.exec(
+                select(Post)
+                .where(Post.platform.ilike(platform))
+                .order_by(Post.fetched_at.desc())
+            ).all()
+
+            if len(posts) > LIMIT_PER_PLATFORM:
+                to_delete = posts[LIMIT_PER_PLATFORM:]
+                deleted_count = 0
+                for old_post in to_delete:
+                    # Protection: Check if post has any generated comments
+                    # We don't want to delete posts that the user is working on or has posted to
+                    has_comments = session.exec(
+                        select(GeneratedComment).where(GeneratedComment.post_id == old_post.id)
+                    ).first()
+                    
+                    if not has_comments:
+                        session.delete(old_post)
+                        deleted_count += 1
+                
+                if deleted_count > 0:
+                    session.commit()
+                    log_activity(session, "posts_cleanup", f"Removed {deleted_count} old posts for {platform}")
+
+    except Exception as e:
+        print(f"Error cleaning up old posts: {e}")
     
     if new_posts:
         log_activity(session, "posts_fetched", f"Fetched {len(new_posts)} new posts total")
     elif not connected_platforms:
          log_activity(session, "posts_fetch_skipped", "No connected accounts found to fetch posts from")
 
-    return new_posts
+    return {"count": len(new_posts), "posts": new_posts}
 
 @app.get("/posts", response_model=List[Post])
 def get_posts(
@@ -276,7 +370,7 @@ def get_posts(
         # which adheres to "only show post of connected account".
         
         # Standardize known platforms
-        standard_platforms = ["Twitter", "LinkedIn", "Instagram", "Facebook"]
+        standard_platforms = ["Twitter", "LinkedIn", "Instagram", "Facebook", "Reddit"]
         valid_db_platforms = [p for p in standard_platforms if p.lower() in connected_platforms]
         
         # Also allow exact case matches if stored differently (e.g. if user manually added "twitter")
@@ -649,7 +743,7 @@ def simulate_post_comment(
     comment_id: int,
     session: Session = Depends(get_session)
 ):
-    """Simulate posting a comment (with delay to mimic human behavior)."""
+    """Post a comment (Real API if available, else Simulated)."""
     comment = session.get(GeneratedComment, comment_id)
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
@@ -657,22 +751,30 @@ def simulate_post_comment(
     if comment.status != "approved":
         raise HTTPException(status_code=400, detail="Only approved comments can be posted")
     
-    # Simulate delay (would be actual API call in production)
-    min_delay = int(get_setting(session, "min_delay_seconds"))
-    max_delay = int(get_setting(session, "max_delay_seconds"))
+    # Use the posting queue helper to handle real or simulated posting
+    # Note: _process_posting_queue is defined later in the file
+    result = _process_posting_queue(session, [comment])
     
-    # Update status
-    comment.status = "posted"
-    comment.posted_at = datetime.utcnow()
-    session.add(comment)
-    session.commit()
-    
-    log_activity(session, "comment_posted", f"Comment ID {comment_id} posted (simulated)")
-    
-    return {
-        "message": f"Comment posted successfully (simulated with {min_delay}-{max_delay}s delay)",
-        "comment": comment
-    }
+    if result["posted_count"] > 0:
+        session.refresh(comment)
+        msg = "Comment posted successfully"
+        
+        # Check metadata from result
+        meta = result.get("results_data", {}).get(comment_id)
+        if meta and meta.get("url"):
+             msg += f" to {meta['url']}"
+        else:
+             msg += " (simulated)"
+
+        log_activity(session, "comment_posted", f"Comment ID {comment_id} posted")
+        
+        return {
+            "message": msg,
+            "comment": comment
+        }
+    else:
+        error_msg = result["errors"][0] if result["errors"] else "Unknown posting error"
+        raise HTTPException(status_code=400, detail=error_msg)
 
 @app.get("/automation/scheduled")
 def get_scheduled_comments(session: Session = Depends(get_session)):
@@ -689,30 +791,7 @@ def get_scheduled_comments(session: Session = Depends(get_session)):
         "comments": due_comments
     }
 
-@app.post("/automation/process-scheduled")
-def process_scheduled_comments(session: Session = Depends(get_session)):
-    """Process all due scheduled comments."""
-    now = datetime.utcnow()
-    due_comments = session.exec(
-        select(GeneratedComment)
-        .where(GeneratedComment.status == "scheduled")
-        .where(GeneratedComment.scheduled_at <= now)
-    ).all()
-    
-    processed = []
-    for comment in due_comments:
-        comment.status = "posted"
-        comment.posted_at = datetime.utcnow()
-        session.add(comment)
-        processed.append(comment.id)
-        log_activity(session, "scheduled_comment_posted", f"Scheduled comment ID {comment.id} auto-posted")
-    
-    session.commit()
-    
-    return {
-        "processed_count": len(processed),
-        "processed_ids": processed
-    }
+
 
 # ==================== BATCH OPERATIONS ====================
 
@@ -811,26 +890,123 @@ def batch_generate_comments(
         "errors": errors
     }
 
+
+def _process_posting_queue(session: Session, comments: List[GeneratedComment]):
+    """Helper to post a list of comments to their respective platforms."""
+    posted_ids = []
+    errors = []
+    # Track metadata for response (since GeneratedComment doesn't have metadata field yet)
+    results_data = {} 
+    
+    # Get all connected accounts for lookups
+    connected_accounts = session.exec(select(ConnectedAccount)).all()
+    accounts_by_platform = {}
+    for acc in connected_accounts:
+        p_lower = acc.platform.lower()
+        if p_lower not in accounts_by_platform:
+             accounts_by_platform[p_lower] = []
+        accounts_by_platform[p_lower].append(acc)
+        
+    for comment in comments:
+        post = session.get(Post, comment.post_id)
+        if not post:
+            errors.append(f"Post {comment.post_id} not found for comment {comment.id}")
+            continue
+            
+        platform = post.platform.lower()
+        
+        # Check if we have an account for this platform
+        accounts = accounts_by_platform.get(platform)
+        if not accounts:
+            if platform == "reddit":
+                 errors.append(f"No connected Reddit account found for comment {comment.id}")
+                 continue 
+            
+            # For others/mock, simulate success
+            comment.status = "posted"
+            comment.posted_at = datetime.utcnow()
+            session.add(comment)
+            posted_ids.append(comment.id)
+            results_data[comment.id] = {"url": f"https://mock.com/post/{comment.id}", "id": f"mock_{comment.id}"}
+            continue
+            
+        # Use first account
+        account = accounts[0]
+        
+        try:
+            # Prepare credentials
+            if platform == "reddit":
+                import json
+                try:
+                    creds = json.loads(account.access_token)
+                except:
+                    creds = {"access_token": account.access_token, "username": account.username}
+            else:
+                creds = {"access_token": account.access_token}
+                
+            integration = SocialMediaFactory.get_integration(platform, method="api")
+            
+            # Extract External ID (since Post model lacks it)
+            external_id = str(post.id) 
+            if platform == "reddit":
+                 import re
+                 # https://reddit.com/r/sub/comments/ID/title/
+                 match = re.search(r"/comments/([a-zA-Z0-9]+)", post.url)
+                 if match:
+                     external_id = match.group(1)
+            
+            # Post comment
+            result = integration.post_comment(creds, external_id, comment.content)
+            
+            if result.get("success"):
+                comment.status = "posted"
+                comment.posted_at = datetime.utcnow()
+                # Store metadata in return object, not model (until schema update)
+                results_data[comment.id] = {"url": result.get("url"), "id": result.get("id")}
+                
+                session.add(comment)
+                posted_ids.append(comment.id)
+            else:
+                errors.append(f"Failed to post to {platform}: {result.get('error')}")
+
+        except Exception as e:
+            errors.append(f"Error posting comment {comment.id}: {str(e)}")
+            
+    session.commit()
+    return {"posted_count": len(posted_ids), "posted_ids": posted_ids, "errors": errors, "results_data": results_data}
+
 @app.post("/batch/post-approved")
 def batch_post_approved_comments(session: Session = Depends(get_session)):
-    """Post all approved comments."""
+    """Post all approved comments to real platforms."""
     approved_comments = session.exec(
         select(GeneratedComment).where(GeneratedComment.status == "approved")
     ).all()
     
-    posted_ids = []
-    for comment in approved_comments:
-        comment.status = "posted"
-        comment.posted_at = datetime.utcnow()
-        session.add(comment)
-        posted_ids.append(comment.id)
+    result = _process_posting_queue(session, approved_comments)
     
-    session.commit()
-    log_activity(session, "batch_post", f"Batch posted {len(posted_ids)} approved comments")
+    log_activity(session, "batch_post", f"Batch posted {result['posted_count']} approved comments")
+    
+    return result
+
+@app.post("/automation/process-scheduled")
+def process_scheduled_comments(session: Session = Depends(get_session)):
+    """Process and post comments that are scheduled and due."""
+    now = datetime.utcnow()
+    scheduled_comments = session.exec(
+        select(GeneratedComment)
+        .where(GeneratedComment.status == "scheduled")
+        .where(GeneratedComment.scheduled_time <= now)
+    ).all()
+    
+    result = _process_posting_queue(session, scheduled_comments)
+    
+    log_activity(session, "process_scheduled", f"Processed {len(scheduled_comments)} scheduled comments ({result['posted_count']} posted)")
     
     return {
-        "posted_count": len(posted_ids),
-        "posted_ids": posted_ids
+        "processed_count": len(scheduled_comments),
+        "posted_count": result["posted_count"],
+        "posted_ids": result["posted_ids"],
+        "errors": result["errors"]
     }
 
 @app.get("/automation/status")
@@ -948,7 +1124,28 @@ def connect_account(
         # Validate lightly
         validation = integration.validate_token({"username": request.username})
     
-    # 2. Real Token Mode
+    # 2. Reddit API Mode - Parse JSON credentials
+    elif request.platform.lower() == "reddit" and request.access_token:
+        try:
+            import json
+            reddit_creds = json.loads(request.access_token)
+            
+            integration = SocialMediaFactory.get_integration("reddit", method="api")
+            validation = integration.validate_token(reddit_creds)
+            
+            if not validation.get("valid"):
+                raise HTTPException(status_code=400, detail=f"Invalid Reddit credentials: {validation.get('error')}")
+            
+            # Store the JSON credentials as the token
+            final_token = request.access_token
+            final_username = f"r/{reddit_creds.get('subreddit', 'all')}"
+            
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid Reddit credentials format")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    # 3. Real Token Mode (for other platforms)
     elif request.access_token:
         try:
             integration = SocialMediaFactory.get_integration(request.platform, method="api")
@@ -1014,6 +1211,251 @@ def disconnect_account(account_id: int, session: Session = Depends(get_session))
     log_activity(session, "account_disconnected", f"Disconnected {account.platform} account: {account.username}")
     
     return {"message": "Account disconnected successfully"}
+
+# ==================== OAUTH ENDPOINTS ====================
+
+@app.get("/oauth/status")
+def get_oauth_status():
+    """Get OAuth configuration status for all platforms."""
+    if not OAUTH_AVAILABLE:
+        return {
+            "oauth_available": False,
+            "message": "OAuth handlers not properly configured. Check import errors.",
+            "platforms": {}
+        }
+    
+    platforms = ["twitter", "linkedin", "instagram"]
+    status = {}
+    
+    for platform in platforms:
+        status[platform] = {
+            "configured": is_oauth_configured(platform),
+            "oauth_url": f"/oauth/{platform}/authorize" if is_oauth_configured(platform) else None
+        }
+    
+    return {
+        "oauth_available": True,
+        "platforms": status
+    }
+
+@app.get("/oauth/{platform}/authorize")
+def oauth_authorize(platform: str, redirect_uri: Optional[str] = None):
+    """Initiate OAuth flow for a platform. Returns authorization URL."""
+    if not OAUTH_AVAILABLE:
+        raise HTTPException(status_code=501, detail="OAuth not available on this server")
+    
+    platform = platform.lower()
+    if platform not in ["twitter", "linkedin", "instagram"]:
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+    
+    if not is_oauth_configured(platform):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"OAuth not configured for {platform}. Please set {platform.upper()}_CLIENT_ID and {platform.upper()}_CLIENT_SECRET environment variables."
+        )
+    
+    handler = get_oauth_handler(platform)
+    if not handler:
+        raise HTTPException(status_code=500, detail="Could not initialize OAuth handler")
+    
+    # Generate state for CSRF protection
+    state = secrets.token_urlsafe(32)
+    
+    # For Twitter, generate PKCE
+    code_verifier = None
+    code_challenge = None
+    
+    if platform == "twitter":
+        code_verifier, code_challenge = handler.generate_pkce()
+        auth_url = handler.get_authorization_url(state, code_challenge)
+    else:
+        auth_url = handler.get_authorization_url(state)
+    
+    # Store state with expiry (5 minutes)
+    oauth_states[state] = {
+        "platform": platform,
+        "code_verifier": code_verifier,
+        "created_at": datetime.utcnow(),
+        "redirect_uri": redirect_uri or FRONTEND_URL
+    }
+    
+    # Clean up old states (older than 5 minutes)
+    cutoff = datetime.utcnow() - timedelta(minutes=5)
+    expired_states = [s for s, data in oauth_states.items() if data["created_at"] < cutoff]
+    for s in expired_states:
+        del oauth_states[s]
+    
+    return {
+        "authorization_url": auth_url,
+        "state": state,
+        "platform": platform
+    }
+
+from fastapi.responses import RedirectResponse
+
+@app.get("/oauth/{platform}/callback")
+def oauth_callback(
+    platform: str,
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+    error_description: str = Query(None),
+    session: Session = Depends(get_session)
+):
+    """Handle OAuth callback from social platform."""
+    if not OAUTH_AVAILABLE:
+        raise HTTPException(status_code=501, detail="OAuth not available")
+    
+    platform = platform.lower()
+    
+    # Handle OAuth error
+    if error:
+        error_msg = error_description or error
+        frontend_url = FRONTEND_URL
+        return RedirectResponse(
+            url=f"{frontend_url}/settings?oauth_error={error_msg}&platform={platform}"
+        )
+    
+    if not code or not state:
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/settings?oauth_error=Missing code or state&platform={platform}"
+        )
+    
+    # Validate state
+    if state not in oauth_states:
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/settings?oauth_error=Invalid or expired state&platform={platform}"
+        )
+    
+    state_data = oauth_states.pop(state)
+    
+    if state_data["platform"] != platform:
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/settings?oauth_error=State platform mismatch&platform={platform}"
+        )
+    
+    handler = get_oauth_handler(platform)
+    
+    try:
+        # Exchange code for tokens
+        if platform == "twitter":
+            token_data = handler.exchange_code(code, state_data.get("code_verifier"))
+        else:
+            token_data = handler.exchange_code(code)
+        
+        if "error" in token_data:
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/settings?oauth_error={token_data['error']}&platform={platform}"
+            )
+        
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data.get("expires_in", 3600)
+        
+        # Get user info
+        user_info = handler.get_user_info(access_token)
+        
+        if "error" in user_info:
+            return RedirectResponse(
+                url=f"{FRONTEND_URL}/settings?oauth_error=Failed to get user info&platform={platform}"
+            )
+        
+        username = user_info.get("username", "unknown_user")
+        display_name = user_info.get("display_name", username)
+        profile_image_url = user_info.get("profile_image_url")
+        
+        # Calculate token expiry
+        token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in) if expires_in else None
+        
+        # Check if account already exists
+        existing = session.exec(
+            select(ConnectedAccount)
+            .where(ConnectedAccount.platform == platform.capitalize())
+            .where(ConnectedAccount.username == username)
+        ).first()
+        
+        if existing:
+            # Update existing account
+            existing.access_token = access_token
+            existing.refresh_token = refresh_token
+            existing.token_expires_at = token_expires_at
+            existing.display_name = display_name
+            existing.profile_image_url = profile_image_url or existing.profile_image_url
+            existing.is_active = True
+            existing.last_used_at = datetime.utcnow()
+            existing.platform_metadata = {"oauth_method": "oauth2", "user_id": user_info.get("id")}
+            session.add(existing)
+            session.commit()
+            log_activity(session, "oauth_account_updated", f"Updated {platform} account via OAuth: {username}")
+        else:
+            # Create new account
+            account = ConnectedAccount(
+                platform=platform.capitalize(),
+                username=username,
+                display_name=display_name,
+                profile_image_url=profile_image_url or f"https://ui-avatars.com/api/?name={username}&background=random",
+                access_token=access_token,
+                refresh_token=refresh_token,
+                token_expires_at=token_expires_at,
+                scopes=token_data.get("scope", "").split(" ") if isinstance(token_data.get("scope"), str) else [],
+                is_active=True,
+                platform_metadata={"oauth_method": "oauth2", "user_id": user_info.get("id")}
+            )
+            session.add(account)
+            session.commit()
+            log_activity(session, "oauth_account_connected", f"Connected {platform} account via OAuth: {username}")
+        
+        redirect_uri = state_data.get("redirect_uri", FRONTEND_URL)
+        return RedirectResponse(
+            url=f"{redirect_uri}/settings?oauth_success=true&platform={platform}&username={username}"
+        )
+        
+    except Exception as e:
+        logger.error(f"OAuth callback error for {platform}: {str(e)}")
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/settings?oauth_error={str(e)}&platform={platform}"
+        )
+
+@app.post("/oauth/{platform}/refresh")
+def oauth_refresh_token(platform: str, account_id: int, session: Session = Depends(get_session)):
+    """Refresh OAuth token for an account."""
+    if not OAUTH_AVAILABLE:
+        raise HTTPException(status_code=501, detail="OAuth not available")
+    
+    account = session.get(ConnectedAccount, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    
+    if account.platform.lower() != platform.lower():
+        raise HTTPException(status_code=400, detail="Platform mismatch")
+    
+    if not account.refresh_token:
+        raise HTTPException(status_code=400, detail="No refresh token available. Re-authorization required.")
+    
+    handler = get_oauth_handler(platform.lower())
+    
+    try:
+        token_data = handler.refresh_token(account.refresh_token)
+        
+        if "error" in token_data:
+            raise HTTPException(status_code=400, detail=f"Token refresh failed: {token_data['error']}")
+        
+        account.access_token = token_data.get("access_token", account.access_token)
+        account.refresh_token = token_data.get("refresh_token", account.refresh_token)
+        
+        if token_data.get("expires_in"):
+            account.token_expires_at = datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
+        
+        account.last_used_at = datetime.utcnow()
+        session.add(account)
+        session.commit()
+        
+        log_activity(session, "oauth_token_refreshed", f"Refreshed token for {platform}: {account.username}")
+        
+        return {"success": True, "message": "Token refreshed successfully"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token refresh error: {str(e)}")
 
 # ==================== ADVANCED AI FEATURES ====================
 
